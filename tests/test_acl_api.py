@@ -258,3 +258,82 @@ def test_a_loaded_admin_has_a_secret_for_the_current_key(db):
     assert client.shared_secret == Identity(admin.get_public_key()).calc_shared_secret(
         daemon.local_identity.get_private_key()
     )
+
+
+def _room_update_setup(db):
+    old_seed, other_seed = "11" * 32, "44" * 32
+    old_identity = LocalIdentity(seed=bytes.fromhex(old_seed))
+    daemon = _Daemon(db, [("room-a", old_identity)])
+    config = {
+        "identities": {
+            "room_servers": [
+                {"name": "room-a", "identity_key": old_seed, "settings": dict(ROOM_SETTINGS)},
+                {"name": "room-b", "identity_key": other_seed, "settings": dict(ROOM_SETTINGS)},
+            ]
+        }
+    }
+    admin = LocalIdentity()
+    daemon.login_helper.get_acl_by_name("room-a").apply_permissions(admin.get_public_key(), 3)
+    return daemon, config, old_identity, admin
+
+
+def test_update_identity_refuses_a_key_another_identity_uses(db, request_ctx):
+    daemon, config, old_identity, admin = _room_update_setup(db)
+    api = _api(daemon, config)
+
+    request_ctx.method = "PUT"
+    request_ctx.json = {"name": "room-a", "new_name": "renamed", "identity_key": "44" * 32}
+    result = api.update_identity()
+
+    assert result["success"] is False
+    assert "already used" in result["error"]
+    room = config["identities"]["room_servers"][0]
+    assert (room["name"], room["identity_key"]) == ("room-a", "11" * 32)
+    api.config_manager.save_to_file.assert_not_called()
+    assert len(db.load_acl_entries(old_identity.get_public_key().hex())) == 1
+
+
+def test_update_identity_does_not_save_a_key_whose_acl_did_not_move(db, request_ctx):
+    daemon, config, old_identity, admin = _room_update_setup(db)
+    api = _api(daemon, config)
+    daemon.login_helper.move_room_acl = MagicMock(side_effect=RuntimeError("disk full"))
+
+    request_ctx.method = "PUT"
+    request_ctx.json = {"name": "room-a", "identity_key": "22" * 32}
+    result = api.update_identity()
+
+    assert result["success"] is False
+    api.config_manager.save_to_file.assert_not_called()
+    assert config["identities"]["room_servers"][0]["identity_key"] == "11" * 32
+
+
+def test_a_failed_config_save_moves_the_acl_back(db, request_ctx):
+    daemon, config, old_identity, admin = _room_update_setup(db)
+    api = _api(daemon, config)
+    api.config_manager.save_to_file.return_value = False
+
+    request_ctx.method = "PUT"
+    request_ctx.json = {"name": "room-a", "identity_key": "22" * 32}
+    assert api.update_identity()["success"] is False
+
+    assert len(db.load_acl_entries(old_identity.get_public_key().hex())) == 1
+    new_identity = LocalIdentity(seed=bytes.fromhex("22" * 32))
+    assert db.load_acl_entries(new_identity.get_public_key().hex()) == []
+
+
+def test_acl_info_uses_the_right_acl_when_hashes_collide(db, request_ctx):
+    daemon = _Daemon(db, [])
+    twin = LocalIdentity()
+    while twin.get_public_key()[0] != daemon.local_identity.get_public_key()[0]:
+        twin = LocalIdentity()
+    daemon.add_room("room-a", twin)
+    daemon.login_helper.get_acl_by_name("room-a").apply_permissions(
+        LocalIdentity().get_public_key(), 3
+    )
+    api = _api(daemon)
+
+    acls = {a["name"]: a for a in api.acl_info()["data"]["acls"]}
+    assert acls["repeater"]["acl_entries"] == 0
+    assert acls["room-a"]["acl_entries"] == 1
+    assert acls["room-a"]["has_admin_password"] is True
+    assert acls["repeater"]["store_error"] is None

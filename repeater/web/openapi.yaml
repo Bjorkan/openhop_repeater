@@ -3129,6 +3129,13 @@ paths:
                                 they were loaded. Entries provisioned with
                                 setperm and not yet used are not counted.
                               example: 5
+                            store_error:
+                              type: string
+                              nullable: true
+                              description: |
+                                Set when the stored ACL could not be read at
+                                startup: stored entries cannot log in, and the
+                                entries listed are not the stored ones.
                             acl_entries:
                               type: integer
                               description: All entries in the ACL, sessions and provisioned
@@ -3196,9 +3203,16 @@ paths:
                         type: integer
                         description: Number of clients returned
                       filter:
-                        type: string
+                        type: object
                         nullable: true
                         description: Filter applied (if any)
+                        properties:
+                          identity_hash:
+                            type: string
+                            nullable: true
+                          identity_name:
+                            type: string
+                            nullable: true
               examples:
                 success:
                   value:

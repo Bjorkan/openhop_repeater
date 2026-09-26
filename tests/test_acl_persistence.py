@@ -359,19 +359,58 @@ def test_a_room_renamed_and_rekeyed_in_one_update_keeps_its_acl(db):
     assert _login(restarted, admin, "", 1) == (True, PERM_ACL_ADMIN)
 
 
-def test_moving_onto_a_key_with_entries_keeps_the_existing_ones(db):
+def test_moving_onto_a_key_that_has_entries_is_refused(db):
+    # Those entries belong to another identity; merging would hand them over.
     old_key, new_key = LocalIdentity(), LocalIdentity()
-    admin = LocalIdentity()
+    admin, other = LocalIdentity(), LocalIdentity()
     _cli(_room_acl(db, old_key))._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
-    _cli(_room_acl(db, new_key))._cmd_setperm(f"setperm {admin.get_public_key().hex()} 131")
+    _cli(_room_acl(db, new_key))._cmd_setperm(f"setperm {other.get_public_key().hex()} 3")
 
-    assert (
+    with pytest.raises(ValueError):
         db.move_acl_identity(
             old_key.get_public_key().hex(), new_key.get_public_key().hex(), "room_server:room-a"
         )
-        == 0
+    assert sorted(r["identity_pubkey"] for r in _acl_rows(db)) == sorted(
+        [old_key.get_public_key().hex(), new_key.get_public_key().hex()]
     )
-    assert [r["permissions"] for r in _acl_rows(db)] == [131]
+
+
+def test_a_move_racing_a_grant_does_not_strand_it_under_the_old_key(db):
+    old_key, new_key = LocalIdentity(), LocalIdentity()
+    helper = _login_helper(db)
+    helper.register_identity("room-a", old_key, identity_type="room_server", config=ROOM_CFG)
+    live = helper.get_acl_by_name("room-a")
+    keys = [LocalIdentity().get_public_key() for _ in range(20)]
+
+    def grant():
+        for key in keys:
+            live.apply_permissions(key, PERM_ACL_ADMIN)
+
+    thread = threading.Thread(target=grant)
+    thread.start()
+    helper.move_room_acl(old_key.get_public_key().hex(), new_key.get_public_key().hex(), "room-a")
+    thread.join()
+
+    assert {r["identity_pubkey"] for r in _acl_rows(db)} == {new_key.get_public_key().hex()}
+    assert len(_acl_rows(db)) == 20
+
+
+def test_a_deleted_identity_does_not_write_its_acl_back(db):
+    # Its handlers stay registered until a restart; a straggler login there
+    # must not recreate the rows the delete removed.
+    local = LocalIdentity()
+    admin = LocalIdentity()
+    helper = _login_helper(db)
+    helper.register_identity("room-a", local, identity_type="room_server", config=ROOM_CFG)
+    acl = helper.get_acl_by_name("room-a")
+    _cli(acl)._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+
+    assert helper.forget_identity_acl(local.get_public_key().hex()) == 1
+    _login(acl, LocalIdentity(), "roomadmin", 1, ROOM_CFG)
+    _cli(acl)._cmd_setperm(f"setperm {LocalIdentity().get_public_key().hex()} 3")
+    acl.remove_client(admin.get_public_key())
+
+    assert _acl_rows(db) == []
 
 
 def test_deleting_an_identity_drops_its_acl(db):
@@ -483,11 +522,11 @@ def test_stored_entries_past_max_clients_all_load():
     assert _login(acl, LocalIdentity(), "", 1) == (False, 0)
 
 
-def test_a_failed_store_read_leaves_an_empty_acl():
+def test_a_failed_store_read_is_reported_not_shown_as_empty():
     store = SimpleNamespace(load_acl_entries=MagicMock(side_effect=RuntimeError("db gone")))
     acl = ACL(store=store, local_identity=LocalIdentity(), identity_label="repeater")
     assert acl.load() == 0
-    assert acl.get_num_clients() == 0
+    assert acl.load_error == "db gone"
 
 
 # ---------------------------------------------------------------------------
