@@ -1415,7 +1415,12 @@ class RepeaterDaemon:
                 logger.debug("Push trace data to companion: %s", e)
 
     def _register_identity_everywhere(
-        self, name: str, identity, config: dict, identity_type: str
+        self,
+        name: str,
+        identity,
+        config: dict,
+        identity_type: str,
+        previous_name: str | None = None,
     ) -> bool:
         """
         Register an identity with the manager and all helpers in one place.
@@ -1441,6 +1446,7 @@ class RepeaterDaemon:
                 identity=identity,
                 identity_type=identity_type,
                 radio_config=self.config.get("radio", {}),
+                previous_name=previous_name,
             )
 
         if self.protocol_request_helper:

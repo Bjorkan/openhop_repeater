@@ -6704,6 +6704,7 @@ class APIEndpoints:
                             identity=room_identity,
                             config=identity,
                             identity_type="room_server",
+                            previous_name=name_s,
                         )
                         if registration_success:
                             logger.info(
