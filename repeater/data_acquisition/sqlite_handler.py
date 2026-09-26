@@ -4903,28 +4903,41 @@ class SQLiteHandler:
                 (identity_pubkey.lower(), client_pubkey.lower()),
             )
 
-    def move_acl_identity(
+    def copy_acl_identity(
         self, old_identity_pubkey: str, new_identity_pubkey: str, identity_label: str
     ) -> int:
-        """Move an identity's entries to its new public key and label, in one transaction.
+        """Copy an identity's entries to a new public key and label, in one transaction.
 
-        Raises ValueError when the new key already has entries: those belong to
-        another identity, and merging would hand its grants over.
+        The first half of a key change: the old rows stay until the new key is
+        committed, so a failure at any step leaves the committed key with its
+        entries. Raises ValueError when the new key already has entries: those
+        belong to another identity, and merging would hand its grants over.
         """
         old_key = old_identity_pubkey.lower()
         new_key = new_identity_pubkey.lower()
         with self._connect() as conn:
-            if old_key != new_key:
-                occupied = conn.execute(
-                    "SELECT 1 FROM acl_entries WHERE identity_pubkey = ? LIMIT 1", (new_key,)
-                ).fetchone()
-                if occupied:
-                    raise ValueError(f"key {new_key[:8]}... already has ACL entries")
+            occupied = conn.execute(
+                "SELECT 1 FROM acl_entries WHERE identity_pubkey = ? LIMIT 1", (new_key,)
+            ).fetchone()
+            if occupied:
+                raise ValueError(f"key {new_key[:8]}... already has ACL entries")
             return conn.execute(
-                "UPDATE acl_entries SET identity_pubkey = ?, identity_label = ? "
-                "WHERE identity_pubkey = ?",
-                (new_key, identity_label, old_key),
+                """
+                INSERT INTO acl_entries (identity_pubkey, identity_label, client_pubkey,
+                                         permissions, updated_at)
+                SELECT ?, ?, client_pubkey, permissions, ?
+                FROM acl_entries WHERE identity_pubkey = ?
+                """,
+                (new_key, identity_label, time.time(), old_key),
             ).rowcount
+
+    def relabel_acl_identity(self, identity_pubkey: str, identity_label: str) -> None:
+        """Record a renamed identity's new label on its entries."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE acl_entries SET identity_label = ? WHERE identity_pubkey = ?",
+                (identity_label, identity_pubkey.lower()),
+            )
 
     def delete_acl_identity(self, identity_pubkey: str) -> int:
         """Drop every ACL entry of a deleted identity."""

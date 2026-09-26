@@ -8,6 +8,8 @@ from openhop_core.protocol import CryptoUtils, PacketBuilder
 from openhop_core.protocol.constants import PAYLOAD_TYPE_TXT_MSG
 from openhop_core.protocol.packet_utils import PathUtils
 
+from .acl import ACLStoreError
+
 logger = logging.getLogger("RoomServer")
 
 # Hard limit from C++ simple_room_server
@@ -625,7 +627,11 @@ class RoomServer:
                     client_pubkey = bytes.fromhex(client_pubkey_hex)
                     acl_client = self.acl.get_client(client_pubkey)
                     if acl_client is None or not acl_client.is_admin():
-                        self.acl.remove_client(client_pubkey)
+                        try:
+                            self.acl.remove_client(client_pubkey)
+                        except ACLStoreError:
+                            # Logged by the ACL; carry on with the other clients.
+                            pass
 
                     logger.info(
                         f"Room '{self.room_name}': Evicted client "

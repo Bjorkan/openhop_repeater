@@ -3202,6 +3202,14 @@ paths:
                       count:
                         type: integer
                         description: Number of clients returned
+                      store_errors:
+                        type: object
+                        additionalProperties:
+                          type: string
+                        description: |
+                          Identity name to error, for identities whose stored ACL
+                          could not be read at startup; their list is not the
+                          stored one.
                       filter:
                         type: object
                         nullable: true

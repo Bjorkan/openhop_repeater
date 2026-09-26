@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import os
@@ -6759,21 +6760,30 @@ class APIEndpoints:
 
             # Update fields
             identity = room_servers[identity_index]
-            old_identity_key = identity.get("identity_key")
-            old_name = identity.get("name")
+            # Snapshot for a refused update: `identity` is the live config
+            # entry, and a later unrelated save would write a half-applied one.
+            snapshot = copy.deepcopy(identity)
+
+            def refuse(message):
+                identity.clear()
+                identity.update(snapshot)
+                return self._error(message)
+
+            old_identity_key = snapshot.get("identity_key")
+            old_name = snapshot.get("name")
 
             if "new_name" in data:
                 new_name = data["new_name"]
                 new_name = str(new_name).strip() if new_name is not None else ""
                 if not new_name:
-                    return self._error("new_name cannot be empty")
+                    return refuse("new_name cannot be empty")
                 # Check if new name conflicts
                 if any(
                     str(r.get("name") or "").strip() == new_name
                     for i, r in enumerate(room_servers)
                     if i != identity_index
                 ):
-                    return self._error(f"Identity with name '{new_name}' already exists")
+                    return refuse(f"Identity with name '{new_name}' already exists")
                 identity["name"] = new_name
 
             # Only update identity_key if a valid full key is provided
@@ -6792,11 +6802,12 @@ class APIEndpoints:
                         # Two identities on one key would share an access list
                         # (and a mesh address); refuse before anything is changed.
                         new_pubkey = derive_companion_public_key_hex(new_key)
-                        if new_pubkey and new_pubkey in self._other_identity_pubkeys(
-                            identity_index
-                        ):
-                            identity["name"] = old_name
-                            return self._error("That key is already used by another identity")
+                        if not new_pubkey:
+                            return refuse("identity_key is not a usable private key")
+                        if new_pubkey in self._other_identity_pubkeys(identity_index):
+                            return refuse(
+                                "That key is already used by another identity; no change was made"
+                            )
                         identity["identity_key"] = new_key
                         logger.info(f"Updated identity_key for '{name_s}'")
 
@@ -6810,51 +6821,46 @@ class APIEndpoints:
                     if field in identity["settings"]:
                         hours = int(identity["settings"][field])
                         if hours != 0 and (hours < 1 or hours > 168):
-                            return self._error(f"{field} must be 0 (off) or 1-168 hours")
+                            return refuse(f"{field} must be 0 (off) or 1-168 hours")
                         identity["settings"][field] = hours
 
                 # Validate passwords are different if both are now set
                 admin_pw = identity["settings"].get("admin_password")
                 guest_pw = identity["settings"].get("guest_password")
                 if admin_pw and guest_pw and admin_pw == guest_pw:
-                    return self._error("admin_password and guest_password must be different")
-
-            # Carry the room's stored ACL over to its new key and name before
-            # the config is saved: room servers are not adopted by label, so a
-            # saved new key whose move failed would start with an empty ACL.
-            old_pubkey = derive_companion_public_key_hex(old_identity_key)
-            new_pubkey = derive_companion_public_key_hex(identity.get("identity_key"))
-            acl_moved = False
-            if (
-                old_pubkey
-                and new_pubkey
-                and (old_pubkey != new_pubkey or old_name != identity["name"])
-            ):
-                try:
-                    self._move_room_acl(old_pubkey, new_pubkey, identity["name"])
-                    acl_moved = True
-                except Exception as e:
-                    logger.error(f"Failed to move the ACL of '{name_s}': {e}")
-                    identity["identity_key"] = old_identity_key
-                    identity["name"] = old_name
-                    return self._error(
-                        f"Could not move the access list to the new key or name: {e}"
-                    )
+                    return refuse("admin_password and guest_password must be different")
 
             # Save to config
             room_servers[identity_index] = identity
             self.config["identities"]["room_servers"] = room_servers
 
-            saved = self.config_manager.save_to_file()
-            if not saved:
-                if acl_moved:
-                    try:
-                        self._move_room_acl(new_pubkey, old_pubkey, old_name)
-                    except Exception as e:
-                        logger.error(f"Could not move the ACL of '{name_s}' back: {e}")
-                identity["identity_key"] = old_identity_key
-                identity["name"] = old_name
-                return self._error("Failed to save configuration to file")
+            class _SaveFailed(Exception):
+                pass
+
+            def commit():
+                if not self.config_manager.save_to_file():
+                    raise _SaveFailed()
+
+            # A key or name change moves the room's stored ACL around the save
+            # (copy, save, drop the old rows), so whichever key the saved config
+            # names holds the entries. Room servers are not adopted by label,
+            # so this is the only path that carries them to a new key.
+            old_pubkey = derive_companion_public_key_hex(old_identity_key)
+            new_pubkey = derive_companion_public_key_hex(identity.get("identity_key"))
+            try:
+                if (
+                    old_pubkey
+                    and new_pubkey
+                    and (old_pubkey != new_pubkey or old_name != identity["name"])
+                ):
+                    self._move_room_acl(old_name, old_pubkey, new_pubkey, identity["name"], commit)
+                else:
+                    commit()
+            except _SaveFailed:
+                return refuse("Failed to save configuration to file")
+            except Exception as e:
+                logger.error(f"Failed to move the ACL of '{name_s}': {e}")
+                return refuse(f"Could not move the access list to the new key or name: {e}")
 
             logger.info(f"Updated identity: {name_s}")
 
@@ -7039,8 +7045,8 @@ class APIEndpoints:
                 if not pubkey:
                     continue
                 try:
-                    if login_helper is not None and hasattr(login_helper, "forget_identity_acl"):
-                        login_helper.forget_identity_acl(pubkey)
+                    if login_helper is not None:
+                        login_helper.forget_identity_acl(name_s, pubkey)
                     elif sqlite_handler is not None:
                         sqlite_handler.delete_acl_identity(pubkey)
                 except Exception as e:
@@ -7274,36 +7280,42 @@ class APIEndpoints:
                     keys.add(pubkey)
         return keys
 
-    def _move_room_acl(self, old_pubkey: str, new_pubkey: str, new_name: str) -> None:
-        """Move a room's stored ACL, through the live ACL when the daemon has one."""
+    def _move_room_acl(
+        self, old_name: str, old_pubkey: str, new_pubkey: str, new_name: str, commit
+    ) -> None:
+        """Move a room's stored ACL around ``commit``, through the live ACL if there is one."""
         login_helper = getattr(self.daemon_instance, "login_helper", None)
-        if login_helper is not None and hasattr(login_helper, "move_room_acl"):
-            login_helper.move_room_acl(old_pubkey, new_pubkey, new_name)
+        if login_helper is not None:
+            login_helper.move_room_acl(old_name, old_pubkey, new_pubkey, new_name, commit)
             return
         storage = getattr(getattr(self.daemon_instance, "repeater_handler", None), "storage", None)
         sqlite_handler = getattr(storage, "sqlite_handler", None)
-        if sqlite_handler is not None:
-            from repeater.handler_helpers.acl import acl_identity_label
+        if sqlite_handler is None and old_pubkey != new_pubkey:
+            # A key change with nowhere to move the entries would save a key
+            # whose access list is gone.
+            raise RuntimeError("no ACL store is available to move the room's access list")
+        from repeater.handler_helpers.acl import acl_identity_label, move_identity_acl
 
-            sqlite_handler.move_acl_identity(
-                old_pubkey, new_pubkey, acl_identity_label(new_name, "room_server")
-            )
+        move_identity_acl(
+            sqlite_handler,
+            old_pubkey,
+            new_pubkey,
+            acl_identity_label(new_name, "room_server"),
+            commit,
+        )
 
     @staticmethod
     def _acl_counts(acl) -> dict:
         """Entry counts for one ACL. Provisioned entries are not sessions."""
         clients = acl.get_all_clients()
-        is_persisted = getattr(acl, "is_persisted", None)
         return {
             # Set when the stored ACL could not be read: the entries shown are
             # then not the stored ones.
-            "store_error": getattr(acl, "load_error", None),
+            "store_error": acl.load_error,
             # Entries that logged in (or sent a message) since they were loaded.
             "authenticated_clients": sum(1 for c in clients if c.last_activity),
             "acl_entries": len(clients),
-            "stored_entries": sum(
-                1 for c in clients if is_persisted and is_persisted(c.id.get_public_key())
-            ),
+            "stored_entries": sum(1 for c in clients if acl.is_persisted(c.id.get_public_key())),
         }
 
     def _acl_owners(self) -> list:
@@ -7316,22 +7328,18 @@ class APIEndpoints:
         login_helper = getattr(daemon, "login_helper", None)
         if login_helper is None:
             return []
-        by_name = getattr(login_helper, "get_acl_by_name", None)
-        by_hash = login_helper.get_acl_dict()
-
-        def lookup(name, identity):
-            acl = by_name(name) if by_name else None
-            return acl if acl is not None else by_hash.get(identity.get_public_key()[0])
 
         owners = []
         if getattr(daemon, "local_identity", None):
-            acl = lookup("repeater", daemon.local_identity)
+            acl = login_helper.get_acl_by_name("repeater")
             if acl is not None:
                 owners.append(("repeater", "repeater", daemon.local_identity, acl))
         for name, identity, _config in daemon.identity_manager.get_identities_by_type(
             "room_server"
         ):
-            acl = lookup(name, identity)
+            # A room without passwords is not registered for logins, so it
+            # has no ACL, and none borrowed from an identity sharing its hash.
+            acl = login_helper.get_acl_by_name(name)
             if acl is not None:
                 owners.append((name, "room_server", identity, acl))
         return owners
@@ -7475,6 +7483,9 @@ class APIEndpoints:
                 return self._error(f"Identity '{identity_name}' not found")
 
             clients_list = []
+            # Identities whose stored ACL could not be read: their list is not
+            # the stored one, and must not pass for an empty one.
+            store_errors = {}
             for name, identity_type, identity, acl in owners:
                 identity_pubkey = identity.get_public_key()
                 if identity_name and name != identity_name:
@@ -7482,7 +7493,8 @@ class APIEndpoints:
                 if target_hash is not None and identity_pubkey[0] != target_hash:
                     continue
 
-                is_persisted = getattr(acl, "is_persisted", None)
+                if acl.load_error:
+                    store_errors[name] = acl.load_error
                 for client in acl.get_all_clients():
                     try:
                         pub_key = client.id.get_public_key()
@@ -7499,7 +7511,7 @@ class APIEndpoints:
                                 # difference between the non-admin roles.
                                 "permissions": acl_role_name(permissions),
                                 "permissions_value": permissions & 0xFF,
-                                "persisted": bool(is_persisted and is_persisted(pub_key)),
+                                "persisted": acl.is_persisted(pub_key),
                                 "last_activity": client.last_activity,
                                 "last_login_success": client.last_login_success,
                                 "last_timestamp": client.last_timestamp,
@@ -7517,6 +7529,7 @@ class APIEndpoints:
                 {
                     "clients": clients_list,
                     "count": len(clients_list),
+                    "store_errors": store_errors,
                     "filter": (
                         {"identity_hash": identity_hash, "identity_name": identity_name}
                         if (identity_hash or identity_name)
@@ -7585,13 +7598,19 @@ class APIEndpoints:
             from repeater.handler_helpers.acl import ACLStoreError
 
             removed_from = []
+            failed = []
             for name, _type, identity, acl in targets:
                 try:
                     if acl.remove_client(public_key):
                         removed_from.append(name)
                 except ACLStoreError as e:
-                    return self._error(f"Could not remove the stored entry from '{name}': {e}")
+                    failed.append(f"{name} ({e})")
 
+            if failed:
+                done = f"; removed from {', '.join(removed_from)}" if removed_from else ""
+                return self._error(
+                    f"Could not remove the stored entry from {', '.join(failed)}{done}"
+                )
             if removed_from:
                 logger.info(
                     f"Removed client {public_key[:6].hex()}... from {', '.join(removed_from)}"
@@ -7722,9 +7741,7 @@ class APIEndpoints:
             if not self.daemon_instance or not hasattr(self.daemon_instance, "login_helper"):
                 return self._error("Login helper not available")
 
-            login_helper = self.daemon_instance.login_helper
             identity_manager = self.daemon_instance.identity_manager
-            acl_dict = login_helper.get_acl_dict()
 
             total_clients = 0
             admin_count = 0
@@ -7736,55 +7753,26 @@ class APIEndpoints:
                 "companion": {"count": 0, "clients": 0},
             }
 
-            # Count repeater
-            if self.daemon_instance.local_identity:
-                repeater_hash = self.daemon_instance.local_identity.get_public_key()[0]
-                repeater_acl = acl_dict.get(repeater_hash)
-                if repeater_acl:
-                    identity_stats["repeater"]["count"] = 1
-                    clients = repeater_acl.get_all_clients()
-                    identity_stats["repeater"]["clients"] = len(clients)
-                    total_clients += len(clients)
-
-                    for client in clients:
-                        if client.is_admin():
-                            admin_count += 1
-                        else:
-                            guest_count += 1
-
-            # Count room servers
-            room_servers = identity_manager.get_identities_by_type("room_server")
-            identity_stats["room_server"]["count"] = len(room_servers)
-
-            for name, identity, config in room_servers:
-                hash_byte = identity.get_public_key()[0]
-                acl = acl_dict.get(hash_byte)
-                if acl:
-                    clients = acl.get_all_clients()
-                    identity_stats["room_server"]["clients"] += len(clients)
-                    total_clients += len(clients)
-
-                    for client in clients:
-                        if client.is_admin():
-                            admin_count += 1
-                        else:
-                            guest_count += 1
+            # By name, not the 1-byte hash two identities can share.
+            owners = self._acl_owners()
+            for _name, identity_type, _identity, acl in owners:
+                clients = acl.get_all_clients()
+                identity_stats[identity_type]["count"] += 1
+                identity_stats[identity_type]["clients"] += len(clients)
+                total_clients += len(clients)
+                for client in clients:
+                    if client.is_admin():
+                        admin_count += 1
+                    else:
+                        guest_count += 1
 
             # Count companions (no admin/guest; they use frame server, not OTA login)
             companions = identity_manager.get_identities_by_type("companion")
             identity_stats["companion"]["count"] = len(companions)
 
-            for name, identity, config in companions:
-                hash_byte = identity.get_public_key()[0]
-                acl = acl_dict.get(hash_byte)
-                if acl:
-                    clients = acl.get_all_clients()
-                    identity_stats["companion"]["clients"] += len(clients)
-                    total_clients += len(clients)
-
             return self._success(
                 {
-                    "total_identities": len(acl_dict),
+                    "total_identities": len(owners),
                     "total_clients": total_clients,
                     "admin_clients": admin_count,
                     "guest_clients": guest_count,
