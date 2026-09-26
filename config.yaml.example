@@ -119,7 +119,8 @@ repeater:
       busy_max: 0.50          # Below this = BUSY tier (0.5x capacity)
       # Above busy_max = CONGESTED tier (0.25x capacity)
 
-  # Security settings for login/authentication (shared across all identities)
+  # Login security for the repeater identity. Each room server has its own
+  # passwords and max_clients in its identity's settings (default 50).
   security:
     # Maximum ACL entries for the repeater (firmware MAX_CLIENTS is 32).
     # Admins are never evicted and are kept across restarts, so a small

@@ -366,7 +366,7 @@ def test_moving_onto_a_key_that_has_entries_is_refused(db):
     old_key, new_key = LocalIdentity(), LocalIdentity()
     admin, other = LocalIdentity(), LocalIdentity()
     _cli(_room_acl(db, old_key))._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
-    _cli(_room_acl(db, new_key))._cmd_setperm(f"setperm {other.get_public_key().hex()} 3")
+    _cli(_room_acl(db, new_key, "room-b"))._cmd_setperm(f"setperm {other.get_public_key().hex()} 3")
 
     with pytest.raises(ValueError):
         db.copy_acl_identity(
@@ -925,3 +925,33 @@ async def test_room_eviction_carries_on_past_a_failed_store_write():
     )
     await _room_server(acl, db)._evict_failed_clients()
     assert len(calls) == 2
+
+
+def test_a_change_retried_after_a_failed_cleanup_goes_through(db):
+    # A failed save whose cleanup also failed leaves a copy at the new key under
+    # this room's label; retrying must replace it, not be refused for ever.
+    old_key, new_key = LocalIdentity(), LocalIdentity()
+    admin = LocalIdentity()
+    _cli(_room_acl(db, old_key))._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+    from repeater.handler_helpers.acl import move_identity_acl
+
+    label = acl_identity_label("room-a", "room_server")
+    real_delete = db.delete_acl_identity
+    db.delete_acl_identity = MagicMock(side_effect=RuntimeError("disk full"))
+
+    def failing_commit():
+        raise OSError("config not written")
+
+    with pytest.raises(OSError):
+        move_identity_acl(
+            db,
+            old_key.get_public_key().hex(),
+            new_key.get_public_key().hex(),
+            label,
+            failing_commit,
+        )
+    db.delete_acl_identity = real_delete
+
+    move_identity_acl(db, old_key.get_public_key().hex(), new_key.get_public_key().hex(), label)
+    assert {r["identity_pubkey"] for r in _acl_rows(db)} == {new_key.get_public_key().hex()}
+    assert len(_acl_rows(db)) == 1

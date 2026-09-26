@@ -3133,9 +3133,10 @@ paths:
                               type: string
                               nullable: true
                               description: |
-                                Set when the stored ACL could not be read at
-                                startup: stored entries cannot log in, and the
-                                entries listed are not the stored ones.
+                                Set while the stored ACL cannot be read (at
+                                startup, and until a later login or change
+                                reads it): stored entries cannot log in, and
+                                the entries listed are not the stored ones.
                             acl_entries:
                               type: integer
                               description: All entries in the ACL, sessions and provisioned
@@ -3208,8 +3209,7 @@ paths:
                           type: string
                         description: |
                           Identity name to error, for identities whose stored ACL
-                          could not be read at startup; their list is not the
-                          stored one.
+                          cannot be read now; their list is not the stored one.
                       filter:
                         type: object
                         nullable: true
@@ -3364,10 +3364,26 @@ paths:
                   data:
                     type: object
                     properties:
-                      total_entries:
+                      total_identities:
                         type: integer
-                      by_identity:
+                        description: Identities with an access list (the repeater and room servers)
+                      total_clients:
+                        type: integer
+                        description: ACL entries across them, sessions and provisioned alike
+                      admin_clients:
+                        type: integer
+                      guest_clients:
+                        type: integer
+                        description: Entries that are not admins (any other role)
+                      by_identity_type:
                         type: object
+                        additionalProperties:
+                          type: object
+                          properties:
+                            count:
+                              type: integer
+                            clients:
+                              type: integer
 
   /room_messages:
     get:
