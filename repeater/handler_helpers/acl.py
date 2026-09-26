@@ -94,8 +94,9 @@ def move_identity_acl(
     if old_label != new_label:
         # Names are unique, so no live identity holds the label this one is
         # taking: rows already under it are leftovers of a deleted identity
-        # whose cleanup failed, and must not become this one's grants.
-        _sweep_leftovers(store, new_label, None)
+        # whose cleanup failed, and must not become this one's grants. This
+        # must succeed; the move (and the rename) fails otherwise.
+        store.delete_acl_label(new_label)
 
     if old_key == new_key:
         if old_label == new_label:
