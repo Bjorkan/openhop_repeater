@@ -322,6 +322,25 @@ class TextHelper:
 
         logger.info(f"Registered {identity_type} '{name}' text handler: hash=0x{hash_byte:02X}")
 
+    def unregister_identity(self, identity) -> bool:
+        """Stop handling messages for ``identity``, and its room's sync loop.
+
+        For a deleted identity, or the old key of one given a new key. Only
+        what belongs to this identity goes; another identity now registered
+        on the same hash byte keeps its handler.
+        """
+        pubkey = identity.get_public_key()
+        hash_byte = pubkey[0]
+        entry = self.handlers.get(hash_byte)
+        if entry is None or entry["identity"].get_public_key() != pubkey:
+            return False
+        del self.handlers[hash_byte]
+        room = self.room_servers.get(hash_byte)
+        if room is not None and room.local_identity.get_public_key() == pubkey:
+            del self.room_servers[hash_byte]
+            self._schedule_room_swap(room.room_name, [room], None)
+        return True
+
     def _take_stale_room_servers(self, hash_byte: int, names: set) -> list:
         """Remove and return the RoomServers a re-registration replaces.
 
@@ -340,7 +359,10 @@ class TextHelper:
                 await old.stop()
             except Exception as e:
                 logger.error(f"Error stopping replaced room server '{old.room_name}': {e}")
-        if room_server is not None:
+        # Two overlapping hot reloads can each schedule a swap; a replacement
+        # that a later one has already superseded must not start, or its sync
+        # loop would run untracked.
+        if room_server is not None and self.room_servers.get(room_server.room_hash) is room_server:
             await room_server.start()
 
     def _schedule_room_swap(self, name: str, stale_rooms: list, room_server) -> None:

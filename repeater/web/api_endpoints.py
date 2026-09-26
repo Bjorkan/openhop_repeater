@@ -6946,6 +6946,15 @@ class APIEndpoints:
                                         f"Hot reload: could not restore '{old_name}'; "
                                         f"it stays registered as '{final_name}'"
                                     )
+                        if (
+                            registration_success
+                            and previous is not None
+                            and previous[0].get_public_key() != room_identity.get_public_key()
+                            and hasattr(self.daemon_instance, "_unregister_identity_everywhere")
+                        ):
+                            # A new key: the old one must stop answering logins
+                            # and requests now, not at the next restart.
+                            self.daemon_instance._unregister_identity_everywhere(previous[0])
                         if registration_success:
                             logger.info(
                                 f"Hot reload: Re-registered identity '{final_name}' with all systems"
@@ -7074,6 +7083,7 @@ class APIEndpoints:
             # until a restart) writing it back. Room servers are not adopted by
             # label, so a later room with this name does not inherit it.
             login_helper = getattr(self.daemon_instance, "login_helper", None)
+            acl_cleanup_error = None
             for entry in removed if login_helper is not None else ():
                 pubkey = derive_companion_public_key_hex(entry.get("identity_key"))
                 if not pubkey:
@@ -7081,6 +7091,9 @@ class APIEndpoints:
                 try:
                     login_helper.forget_identity_acl(name_s, pubkey)
                 except Exception as e:
+                    # Harmless to other rooms (rows load only under this room's
+                    # label), but the operator should know they are there.
+                    acl_cleanup_error = str(e)
                     logger.warning(f"Could not drop the stored ACL of '{name_s}': {e}")
 
             unregister_success = False
@@ -7090,8 +7103,12 @@ class APIEndpoints:
                         identity_manager = self.daemon_instance.identity_manager
 
                         # Release its name and hash slot, so a room re-created with
-                        # this name or key registers live rather than after a restart.
-                        if identity_manager.unregister_identity(name_s) is not None:
+                        # this name or key registers live rather than after a restart,
+                        # and stop its handlers answering on the mesh now.
+                        entry = identity_manager.unregister_identity(name_s)
+                        if entry is not None:
+                            if hasattr(self.daemon_instance, "_unregister_identity_everywhere"):
+                                self.daemon_instance._unregister_identity_everywhere(entry[0])
                             logger.info(f"Unregistered identity {name_s}")
                             unregister_success = True
 
@@ -7105,8 +7122,15 @@ class APIEndpoints:
                 if unregister_success
                 else f"Identity '{name_s}' deleted successfully. Restart required to fully remove."
             )
+            if acl_cleanup_error:
+                message += (
+                    f" Its stored access list could not be removed ({acl_cleanup_error}); "
+                    "it is loaded only by a room with this name and key."
+                )
 
-            return self._success({"name": name_s}, message=message)
+            return self._success(
+                {"name": name_s, "acl_cleanup_error": acl_cleanup_error}, message=message
+            )
 
         except cherrypy.HTTPError:
             raise
@@ -7329,6 +7353,7 @@ class APIEndpoints:
             sqlite_handler,
             old_pubkey,
             new_pubkey,
+            acl_identity_label(old_name, "room_server"),
             acl_identity_label(new_name, "room_server"),
             commit,
         )

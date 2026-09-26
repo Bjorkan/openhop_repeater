@@ -100,6 +100,15 @@ class ProtocolRequestHelper:
 
         logger.info(f"Registered protocol request handler for '{name}': hash=0x{hash_byte:02X}")
 
+    def unregister_identity(self, identity) -> bool:
+        """Stop answering requests for ``identity`` (deleted, or given a new key)."""
+        pubkey = identity.get_public_key()
+        entry = self.handlers.get(pubkey[0])
+        if entry is not None and entry["identity"].get_public_key() == pubkey:
+            del self.handlers[pubkey[0]]
+            return True
+        return False
+
     def _create_acl_contacts_wrapper(self, acl):
         """Create contacts wrapper from ACL."""
 

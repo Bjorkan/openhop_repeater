@@ -122,3 +122,43 @@ async def test_reregister_from_request_thread_stops_old_before_starting_new():
     assert _running_sync_tasks() == [new_room._sync_task]
 
     await helper.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_overlapping_reloads_leave_one_sync_loop():
+    # Two re-registrations scheduled before either swap runs: the first
+    # replacement is superseded and must not start once its swap runs late.
+    acl_dict = {0x41: _FakeACL()}
+    helper = _make_helper(acl_dict)
+    identity = _FakeIdentity(b"A" * 32)
+    helper.register_identity("room", identity, "room_server")
+    await _settle(helper)
+
+    helper.register_identity("room", identity, "room_server")
+    helper.register_identity("room", identity, "room_server")
+    await _settle(helper)
+
+    assert len(_running_sync_tasks()) == 1
+    current = helper.room_servers[0x41]
+    assert current._running is True
+    await current.stop()
+
+
+@pytest.mark.asyncio
+async def test_unregistering_a_retired_key_stops_its_room_and_handler():
+    acl_dict = {0x41: _FakeACL(), 0x42: _FakeACL()}
+    helper = _make_helper(acl_dict)
+    old, new = _FakeIdentity(b"A" * 32), _FakeIdentity(b"B" * 32)
+    helper.register_identity("room", old, "room_server")
+    await _settle(helper)
+    helper.register_identity("room", new, "room_server", previous_name="room")
+    await _settle(helper)
+
+    # The old key's handler outlives the re-registration until it is retired.
+    assert 0x41 in helper.handlers
+    assert helper.unregister_identity(old) is True
+    assert 0x41 not in helper.handlers
+    assert helper.unregister_identity(old) is False
+    # The live room on the new key is untouched.
+    assert helper.room_servers[0x42]._running is True
+    await helper.room_servers[0x42].stop()
