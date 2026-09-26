@@ -643,3 +643,35 @@ def test_a_new_room_does_not_inherit_a_deleted_rooms_leftover_rows(db, request_c
     }
     api.create_identity()
     assert db.load_acl_entries(identity.get_public_key().hex()) == []
+
+
+def test_a_rename_is_refused_when_the_new_names_leftovers_cannot_be_cleared(db, request_ctx):
+    daemon = _LiveDaemon(db, "room-a", "11" * 32)
+    api = _api(daemon, daemon.config)
+    db.delete_acl_label = MagicMock(side_effect=RuntimeError("disk full"))
+
+    request_ctx.method = "PUT"
+    request_ctx.json = {"name": "room-a", "new_name": "room-b"}
+    result = api.update_identity()
+    assert result["success"] is False
+    assert daemon.config["identities"]["room_servers"][0]["name"] == "room-a"
+    api.config_manager.save_to_file.assert_not_called()
+
+
+def test_creating_a_room_is_refused_when_leftovers_under_its_name_cannot_be_cleared(
+    db, request_ctx
+):
+    daemon = _LiveDaemon(db, "room-a", "11" * 32)
+    api = _api(daemon, daemon.config)
+    db.delete_acl_label = MagicMock(side_effect=RuntimeError("disk full"))
+
+    request_ctx.method = "POST"
+    request_ctx.json = {
+        "name": "room-new",
+        "type": "room_server",
+        "identity_key": "44" * 32,
+        "settings": dict(ROOM_SETTINGS),
+    }
+    result = api.create_identity()
+    assert result["success"] is False
+    assert [r["name"] for r in daemon.config["identities"]["room_servers"]] == ["room-a"]

@@ -6478,6 +6478,21 @@ class APIEndpoints:
                     "type": identity_type,
                     "settings": settings,
                 }
+                # A new room has no stored access list. Rows already under its
+                # name are leftovers of a deleted room whose cleanup failed; they
+                # must be gone before the room exists, or they become its grants.
+                login_helper = getattr(self.daemon_instance, "login_helper", None)
+                store = getattr(login_helper, "sqlite_handler", None)
+                if store is not None:
+                    from repeater.handler_helpers.acl import acl_identity_label
+
+                    try:
+                        store.delete_acl_label(acl_identity_label(name, "room_server"))
+                    except Exception as e:
+                        return self._error(
+                            f"Could not clear an old access list stored under '{name}': {e}"
+                        )
+
                 room_servers.append(new_identity)
                 self.config["identities"]["room_servers"] = room_servers
 
@@ -6489,19 +6504,6 @@ class APIEndpoints:
             logger.info(
                 f"Created new identity: {name} (type: {identity_type}){' with auto-generated key' if key_was_generated else ''}"
             )
-
-            # A new room has no stored access list. Rows already under its name
-            # are leftovers of a deleted room whose cleanup failed, and must not
-            # become its grants.
-            login_helper = getattr(self.daemon_instance, "login_helper", None)
-            store = getattr(login_helper, "sqlite_handler", None)
-            if identity_type == "room_server" and store is not None:
-                from repeater.handler_helpers.acl import acl_identity_label
-
-                try:
-                    store.delete_acl_label(acl_identity_label(name, "room_server"))
-                except Exception as e:
-                    logger.warning(f"Could not clear leftover ACL entries for '{name}': {e}")
 
             # Hot reload - register identity immediately
             registration_success = False
