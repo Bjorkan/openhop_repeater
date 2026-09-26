@@ -96,6 +96,9 @@ def move_identity_acl(
             if commit is not None:
                 commit()
             return
+        # Leftovers under the old label elsewhere would keep it once the
+        # room stops carrying it; they belong to no one.
+        _sweep_leftovers(store, old_label, new_key)
         store.relabel_acl_identity(new_key, old_label, new_label)
         if commit is not None:
             try:
@@ -126,8 +129,31 @@ def move_identity_acl(
     except Exception as e:
         logger.warning(
             f"Could not drop the ACL left under the old key {old_key[:8]}...: {e}. "
-            f"Only an identity named '{old_label}' on that key would load it"
+            f"It is swept by the room's next rename or key change, or its deletion"
         )
+    if old_label != new_label:
+        _sweep_leftovers(store, old_label, None)
+    _sweep_leftovers(store, new_label, new_key)
+
+
+def _sweep_leftovers(store, label: str, current_key: Optional[str]) -> None:
+    """Best-effort: drop rows under ``label`` at any key but ``current_key``.
+
+    A room owns only the rows under its label at its current key. Others
+    are left by a cleanup that failed; a failure here is retried by the
+    next sweep. Not run on load: a room whose key was edited by hand in the
+    config would lose rows that setting the key back recovers.
+    """
+    sweep = getattr(store, "delete_acl_label", None)
+    if sweep is None:
+        return
+    try:
+        swept = sweep(label, current_key)
+    except Exception as e:
+        logger.warning(f"Could not sweep leftover ACL entries of '{label}': {e}")
+        return
+    if swept:
+        logger.info(f"Swept {swept} leftover ACL entr{'y' if swept == 1 else 'ies'} of '{label}'")
 
 
 class ClientInfo:

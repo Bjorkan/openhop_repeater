@@ -4976,14 +4976,20 @@ class SQLiteHandler:
                 (new_label, identity_pubkey.lower(), old_label),
             )
 
-    def delete_acl_label(self, identity_label: str) -> int:
-        """Drop every entry stored under ``identity_label``, at any key.
+    def delete_acl_label(self, identity_label: str, except_key: Optional[str] = None) -> int:
+        """Drop every entry stored under ``identity_label``, at any key but ``except_key``.
 
-        For a deleted room: rows a rekey's failed cleanup left at an old key
-        carry its label, and a room re-created with that name on that key
-        would otherwise load them.
+        A room's entries are those under its label at its current key; any
+        others under its label are left by a cleanup that failed, and a room
+        later given that name and key would load them. Used on delete (no
+        exception) and to sweep those leftovers (except the current key).
         """
         with self._connect() as conn:
+            if except_key:
+                return conn.execute(
+                    "DELETE FROM acl_entries WHERE identity_label = ? AND identity_pubkey != ?",
+                    (identity_label, except_key.lower()),
+                ).rowcount
             return conn.execute(
                 "DELETE FROM acl_entries WHERE identity_label = ?", (identity_label,)
             ).rowcount
