@@ -1020,3 +1020,27 @@ def test_a_rename_relabels_before_the_save_and_back_if_it_fails(db):
     move_identity_acl(db, key.get_public_key().hex(), key.get_public_key().hex(), old, new)
     assert _room_acl(db, key, "room-b").load() == 1
     assert _room_acl(db, key, "room-a").load() == 0
+
+
+def test_deleting_a_room_drops_rows_a_failed_rekey_left_at_its_old_key(db):
+    old_key, new_key = LocalIdentity(), LocalIdentity()
+    admin = LocalIdentity()
+    helper = _login_helper(db)
+    helper.register_identity("room-a", old_key, identity_type="room_server", config=ROOM_CFG)
+    _cli(helper.get_acl_by_name("room-a"))._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+
+    real_delete = db.delete_acl_identity
+    db.delete_acl_identity = MagicMock(side_effect=RuntimeError("disk full"))
+    helper.move_room_acl(
+        "room-a", old_key.get_public_key().hex(), new_key.get_public_key().hex(), "room-a"
+    )
+    db.delete_acl_identity = real_delete
+    assert {r["identity_pubkey"] for r in _acl_rows(db)} == {
+        old_key.get_public_key().hex(),
+        new_key.get_public_key().hex(),
+    }
+
+    helper.forget_identity_acl("room-a", new_key.get_public_key().hex())
+    assert _acl_rows(db) == []
+    # A room re-created with the old name and old key gets no leftover admin.
+    assert _room_acl(db, old_key, "room-a").load() == 0
