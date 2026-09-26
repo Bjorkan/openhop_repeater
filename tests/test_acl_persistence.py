@@ -1050,3 +1050,25 @@ def test_rows_a_failed_rekey_left_behind_never_reach_a_later_room(db):
     helper.forget_identity_acl("room-b", new_key.get_public_key().hex())
     assert _acl_rows(db) == []
     assert _room_acl(db, old_key, "room-a").load() == 0
+
+
+def test_a_room_renamed_to_a_deleted_rooms_name_does_not_inherit_its_rows(db):
+    # Codex: delete B whose ACL cleanup fails, create A on B's old key,
+    # rename A to B. B's leftover admin must not become the new B's.
+    key = LocalIdentity()
+    admin, own = LocalIdentity(), LocalIdentity()
+    _cli(_room_acl(db, key, "room-b"))._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+    _cli(_room_acl(db, key, "room-a"))._cmd_setperm(f"setperm {own.get_public_key().hex()} 3")
+    from repeater.handler_helpers.acl import move_identity_acl
+
+    move_identity_acl(
+        db,
+        key.get_public_key().hex(),
+        key.get_public_key().hex(),
+        acl_identity_label("room-a", "room_server"),
+        acl_identity_label("room-b", "room_server"),
+    )
+    renamed = _room_acl(db, key, "room-b")
+    assert renamed.load() == 1
+    assert renamed.get_client(own.get_public_key()) is not None
+    assert renamed.get_client(admin.get_public_key()) is None

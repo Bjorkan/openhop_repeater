@@ -617,3 +617,29 @@ def test_deleting_a_room_stops_it_answering_logins(db, request_ctx):
     assert "deactivated immediately" in result["message"]
     assert room_hash not in daemon.login_helper.handlers
     assert daemon.login_helper.get_acl_by_name("room-a") is None
+
+
+def test_a_new_room_does_not_inherit_a_deleted_rooms_leftover_rows(db, request_ctx):
+    daemon = _LiveDaemon(db, "room-a", "11" * 32)
+    api = _api(daemon, daemon.config)
+    identity = LocalIdentity(seed=bytes.fromhex("11" * 32))
+    daemon.login_helper.get_acl_by_name("room-a").apply_permissions(
+        LocalIdentity().get_public_key(), 3
+    )
+    # The delete's ACL cleanup fails, leaving the old admin stored.
+    real_delete = db.delete_acl_label
+    db.delete_acl_label = MagicMock(side_effect=RuntimeError("disk full"))
+    request_ctx.method = "DELETE"
+    result = api.delete_identity(name="room-a", type="room_server")
+    assert "could not be removed" in result["message"]
+    db.delete_acl_label = real_delete
+
+    request_ctx.method = "POST"
+    request_ctx.json = {
+        "name": "room-a",
+        "type": "room_server",
+        "identity_key": "11" * 32,
+        "settings": dict(ROOM_SETTINGS),
+    }
+    api.create_identity()
+    assert db.load_acl_entries(identity.get_public_key().hex()) == []
