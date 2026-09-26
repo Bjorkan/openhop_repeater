@@ -283,3 +283,85 @@ def test_get_radio_for_board_kiss_omits_unset_tuning(monkeypatch):
     # Unset keys must not be forwarded, so the wrapper keeps its own defaults.
     for key in ("kiss_persistence", "kiss_slottime_ms", "tx_delay_ms", "kiss_full_duplex"):
         assert key not in rc
+
+
+# ─── sync word warning for USB/TCP modems ──────────────────────────────
+
+
+def _capture_modem(monkeypatch, radio_type):
+    module, cls = {
+        "modem_tcp": ("openhop_core.hardware.tcp_radio", "TCPLoRaRadio"),
+        "modem_usb": ("openhop_core.hardware.usb_radio", "USBLoRaRadio"),
+    }[radio_type]
+    pytest.importorskip(module)
+    captured = {}
+
+    class _Dummy(_DummyRadio):
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(f"{module}.{cls}", _Dummy)
+    return captured
+
+
+def _modem_board(radio_type, radio):
+    section = {"host": "modem.local"} if radio_type == "modem_tcp" else {"port": "/dev/ttyACM0"}
+    return {"radio_type": radio_type, radio_type: section, "radio": radio}
+
+
+@pytest.mark.parametrize("radio_type", ["modem_tcp", "modem_usb"])
+def test_modem_on_a_foreign_sync_word_is_warned_about_but_not_overridden(
+    monkeypatch, caplog, radio_type
+):
+    """A modem on another sync word connects, answers pings and transmits but
+    hears no MeshCore traffic, so say so -- without second-guessing the value."""
+    captured = _capture_modem(monkeypatch, radio_type)
+    radio = {**_modem_radio_cfg(), "sync_word": 0x3444}
+
+    with caplog.at_level("WARNING", logger="Config"):
+        get_radio_for_board(_modem_board(radio_type, radio))
+
+    assert captured["sync_word"] == 0x3444
+    assert "sync_word is 0x3444, not MeshCore's 0x12" in caplog.text
+    assert radio_type in caplog.text
+
+
+@pytest.mark.parametrize("radio_type", ["modem_tcp", "modem_usb"])
+@pytest.mark.parametrize("sync_word", [0x12, "0x12", 18, None])
+def test_modem_on_meshcores_sync_word_is_not_warned_about(
+    monkeypatch, caplog, radio_type, sync_word
+):
+    captured = _capture_modem(monkeypatch, radio_type)
+    radio = _modem_radio_cfg()
+    if sync_word is None:
+        radio.pop("sync_word")  # the default
+    else:
+        radio["sync_word"] = sync_word
+
+    with caplog.at_level("WARNING", logger="Config"):
+        get_radio_for_board(_modem_board(radio_type, radio))
+
+    assert captured["sync_word"] == 0x12
+    assert "sync_word" not in caplog.text
+
+
+def test_a_radios_entry_inheriting_a_stray_top_level_sync_word_is_named(monkeypatch, caplog):
+    """The case that bit a real node: a top-level radio.sync_word the SX1262
+    driver ignores, inherited by a modem entry under radios[]."""
+    from repeater.config import _merge_radio_entry
+
+    captured = _capture_modem(monkeypatch, "modem_tcp")
+    global_config = {"radio_type": "sx1262", "radio": {**_modem_radio_cfg(), "sync_word": 13380}}
+    entry = {
+        "id": "narrow",
+        "radio_type": "modem_tcp",
+        "radio": {"frequency": 910525000},
+        "modem_tcp": {"host": "192.168.50.154"},
+    }
+
+    with caplog.at_level("WARNING", logger="Config"):
+        get_radio_for_board(_merge_radio_entry(global_config, entry))
+
+    assert captured["sync_word"] == 0x3444
+    assert "Radio 'narrow' (modem_tcp) sync_word is 0x3444" in caplog.text
+    assert "inherit the top-level radio.sync_word" in caplog.text

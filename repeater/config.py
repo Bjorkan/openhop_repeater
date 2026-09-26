@@ -507,6 +507,33 @@ def _load_or_create_identity_key(path: Optional[str] = None) -> bytes:
     return key
 
 
+# MeshCore's private LoRa sync word, as the USB/TCP modem firmware expects it.
+MESHCORE_SYNC_WORD = 0x12
+
+
+def _checked_modem_sync_word(sync_word: int, board_config: dict, radio_type: str) -> int:
+    """The sync word to hand a USB/TCP modem, warning when it is not MeshCore's.
+
+    These are the drivers that actually push the value to the radio, and a
+    modem on another sync word connects, answers pings and transmits, yet hears
+    no MeshCore traffic -- a silent failure. A radios[] entry inherits the
+    top-level ``radio.sync_word``, which the SX1262 driver ignores, so a stray
+    top-level value is harmless until a modem entry picks it up.
+    """
+    if sync_word != MESHCORE_SYNC_WORD:
+        radio_id = board_config.get("_radio_id")
+        logger.warning(
+            "%s sync_word is 0x%X, not MeshCore's 0x%02X: the modem will not hear "
+            "MeshCore traffic. Set sync_word: 0x%02X in its radio section%s.",
+            f"Radio {radio_id!r} ({radio_type})" if radio_id else f"{radio_type} radio",
+            sync_word,
+            MESHCORE_SYNC_WORD,
+            MESHCORE_SYNC_WORD,
+            " (radios[] entries inherit the top-level radio.sync_word)" if radio_id else "",
+        )
+    return sync_word
+
+
 def get_radio_for_board(board_config: dict):
     board_config = normalize_modem_config(board_config)
 
@@ -752,7 +779,13 @@ def get_radio_for_board(board_config: dict):
             spreading_factor=int(radio_cfg.get("spreading_factor", 8)),
             coding_rate=int(radio_cfg.get("coding_rate", 8)),
             tx_power=int(radio_cfg.get("tx_power", 22)),
-            sync_word=_parse_int(radio_cfg.get("sync_word", 0x12), default=0x12),
+            sync_word=_checked_modem_sync_word(
+                _parse_int(
+                    radio_cfg.get("sync_word", MESHCORE_SYNC_WORD), default=MESHCORE_SYNC_WORD
+                ),
+                board_config,
+                radio_type,
+            ),
             preamble_length=int(radio_cfg.get("preamble_length", 16)),
             lbt_enabled=bool(tcp_cfg.get("lbt_enabled", True)),
             lbt_max_attempts=int(tcp_cfg.get("lbt_max_attempts", 5)),
@@ -794,7 +827,13 @@ def get_radio_for_board(board_config: dict):
             spreading_factor=int(radio_cfg.get("spreading_factor", 8)),
             coding_rate=int(radio_cfg.get("coding_rate", 8)),
             tx_power=int(radio_cfg.get("tx_power", 22)),
-            sync_word=_parse_int(radio_cfg.get("sync_word", 0x12), default=0x12),
+            sync_word=_checked_modem_sync_word(
+                _parse_int(
+                    radio_cfg.get("sync_word", MESHCORE_SYNC_WORD), default=MESHCORE_SYNC_WORD
+                ),
+                board_config,
+                radio_type,
+            ),
             preamble_length=int(radio_cfg.get("preamble_length", 16)),
             lbt_enabled=bool(usb_cfg.get("lbt_enabled", True)),
             lbt_max_attempts=int(usb_cfg.get("lbt_max_attempts", 5)),
