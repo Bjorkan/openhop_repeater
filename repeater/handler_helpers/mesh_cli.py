@@ -1163,6 +1163,15 @@ class MeshCLI:
 
     # ==================== Neighbor Commands ====================
 
+    @staticmethod
+    def _zero_hop_repeaters(neighbors: dict) -> dict:
+        """The nodes MeshCore keeps as neighbours: repeaters heard zero-hop."""
+        return {
+            pubkey: info
+            for pubkey, info in neighbors.items()
+            if info.get("is_repeater", False) and info.get("zero_hop", False)
+        }
+
     def _cmd_neighbors(self) -> str:
         """List neighbors."""
         if not self.storage_handler:
@@ -1175,11 +1184,7 @@ class MeshCLI:
                 return "No neighbors discovered yet"
 
             # Match MeshCore behavior: show only zero-hop repeaters.
-            filtered_neighbors = {
-                pubkey: info
-                for pubkey, info in neighbors.items()
-                if info.get("is_repeater", False) and info.get("zero_hop", False)
-            }
+            filtered_neighbors = self._zero_hop_repeaters(neighbors)
 
             if not filtered_neighbors:
                 return "No zero hop repeaters discovered yet"
@@ -1239,7 +1244,14 @@ class MeshCLI:
             return "ERR: bad pubkey"
 
         try:
-            delete_fn(None if pubkey_hex == "all" else pubkey_hex)
+            if pubkey_hex == "all":
+                # Only what `neighbors` lists (firmware clears its neighbour
+                # table), not every advert: companions, rooms and multi-hop
+                # nodes stay.
+                for pubkey in self._zero_hop_repeaters(self.storage_handler.get_neighbors() or {}):
+                    delete_fn(pubkey)
+            else:
+                delete_fn(pubkey_hex)
             return "OK"
         except Exception as e:
             logger.error(f"neighbor.remove failed: {e}", exc_info=True)
