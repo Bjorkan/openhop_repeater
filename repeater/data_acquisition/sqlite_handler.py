@@ -4835,9 +4835,17 @@ class SQLiteHandler:
     # that reports "OK" for a grant that was never stored, or treats a failed
     # read as "no entries", would misstate who can log in.
     def load_acl_entries(
-        self, identity_pubkey: str, adopt_label: Optional[str] = None
+        self,
+        identity_pubkey: str,
+        identity_label: Optional[str] = None,
+        adopt_label: Optional[str] = None,
     ) -> List[Dict]:
         """Return the stored ACL entries for one local identity.
+
+        With ``identity_label``, only rows under that label are returned: rows
+        at this key under another label belong to another identity (left by
+        a cleanup that failed) and must not grant it access. They are
+        reported in the log and left alone.
 
         With ``adopt_label``, rows stored under that label for a different
         public key are taken over when this key has none: the identity was
@@ -4847,31 +4855,48 @@ class SQLiteHandler:
         explicitly (``acl.move_identity_acl``) when their key changes.
         """
         identity_pubkey = identity_pubkey.lower()
+        label = identity_label or adopt_label
+
+        def select(conn):
+            query = "SELECT client_pubkey, permissions FROM acl_entries WHERE identity_pubkey = ?"
+            args = [identity_pubkey]
+            if label:
+                query += " AND identity_label = ?"
+                args.append(label)
+            return conn.execute(query, args).fetchall()
+
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT client_pubkey, permissions FROM acl_entries WHERE identity_pubkey = ?",
-                (identity_pubkey,),
-            ).fetchall()
+            if label:
+                foreign = conn.execute(
+                    "SELECT identity_label, COUNT(*) AS n FROM acl_entries "
+                    "WHERE identity_pubkey = ? AND identity_label != ? GROUP BY identity_label",
+                    (identity_pubkey, label),
+                ).fetchall()
+                for row in foreign:
+                    logger.warning(
+                        f"ACL for '{label}': ignoring {row['n']} stored entr"
+                        f"{'y' if row['n'] == 1 else 'ies'} at this key that belong to "
+                        f"'{row['identity_label']}'"
+                    )
+            rows = select(conn)
             if rows or not adopt_label:
                 return [dict(row) for row in rows]
 
-            # This key owns no rows, so moving others onto it cannot hit the
-            # primary key.
+            # This key owns no rows under this label, so moving the label's
+            # rows onto it cannot hit the primary key.
             moved = conn.execute(
-                "UPDATE acl_entries SET identity_pubkey = ? WHERE identity_label = ?",
-                (identity_pubkey, adopt_label),
+                "UPDATE acl_entries SET identity_pubkey = ? WHERE identity_label = ? "
+                "AND client_pubkey NOT IN (SELECT client_pubkey FROM acl_entries "
+                "WHERE identity_pubkey = ?)",
+                (identity_pubkey, adopt_label, identity_pubkey),
             ).rowcount
             if moved:
                 logger.info(
                     f"ACL for '{adopt_label}': adopted {moved} entr{'y' if moved == 1 else 'ies'} "
                     f"stored under a previous key"
                 )
-            rows = conn.execute(
-                "SELECT client_pubkey, permissions FROM acl_entries WHERE identity_pubkey = ?",
-                (identity_pubkey,),
-            ).fetchall()
-            return [dict(row) for row in rows]
+            return [dict(row) for row in select(conn)]
 
     def upsert_acl_entry(
         self, identity_pubkey: str, identity_label: str, client_pubkey: str, permissions: int
@@ -4904,16 +4929,22 @@ class SQLiteHandler:
             )
 
     def copy_acl_identity(
-        self, old_identity_pubkey: str, new_identity_pubkey: str, identity_label: str
+        self,
+        old_identity_pubkey: str,
+        new_identity_pubkey: str,
+        old_label: str,
+        new_label: str,
     ) -> int:
         """Copy an identity's entries to a new public key and label, in one transaction.
 
-        The first half of a key change: the old rows stay until the new key is
-        committed, so a failure at any step leaves the committed key with its
-        entries. Raises ValueError when the new key already has entries of
-        another identity: merging would hand its grants over. Entries there
-        under this identity's own label are a copy left by an earlier attempt
-        whose cleanup failed; they are replaced, so the change can be retried.
+        Only rows under ``old_label`` are copied: others at the old key belong
+        to another identity. The first half of a key change: the old rows stay
+        until the new key is committed, so a failure at any step leaves the
+        committed key with its entries. Raises ValueError when the new key
+        already has entries of another identity: merging would hand its grants
+        over. Entries there under ``new_label`` are a copy left by an earlier
+        attempt whose cleanup failed; they are replaced, so the change can be
+        retried.
         """
         old_key = old_identity_pubkey.lower()
         new_key = new_identity_pubkey.lower()
@@ -4921,7 +4952,7 @@ class SQLiteHandler:
             foreign = conn.execute(
                 "SELECT 1 FROM acl_entries WHERE identity_pubkey = ? AND identity_label != ? "
                 "LIMIT 1",
-                (new_key, identity_label),
+                (new_key, new_label),
             ).fetchone()
             if foreign:
                 raise ValueError(f"key {new_key[:8]}... already has another identity's ACL entries")
@@ -4931,22 +4962,30 @@ class SQLiteHandler:
                 INSERT INTO acl_entries (identity_pubkey, identity_label, client_pubkey,
                                          permissions, updated_at)
                 SELECT ?, ?, client_pubkey, permissions, ?
-                FROM acl_entries WHERE identity_pubkey = ?
+                FROM acl_entries WHERE identity_pubkey = ? AND identity_label = ?
                 """,
-                (new_key, identity_label, time.time(), old_key),
+                (new_key, new_label, time.time(), old_key, old_label),
             ).rowcount
 
-    def relabel_acl_identity(self, identity_pubkey: str, identity_label: str) -> None:
-        """Record a renamed identity's new label on its entries."""
+    def relabel_acl_identity(self, identity_pubkey: str, old_label: str, new_label: str) -> None:
+        """Record a renamed identity's new label on its own entries."""
         with self._connect() as conn:
             conn.execute(
-                "UPDATE acl_entries SET identity_label = ? WHERE identity_pubkey = ?",
-                (identity_label, identity_pubkey.lower()),
+                "UPDATE acl_entries SET identity_label = ? "
+                "WHERE identity_pubkey = ? AND identity_label = ?",
+                (new_label, identity_pubkey.lower(), old_label),
             )
 
-    def delete_acl_identity(self, identity_pubkey: str) -> int:
-        """Drop every ACL entry of a deleted identity."""
+    def delete_acl_identity(
+        self, identity_pubkey: str, identity_label: Optional[str] = None
+    ) -> int:
+        """Drop an identity's ACL entries: only those under ``identity_label``, if given."""
         with self._connect() as conn:
+            if identity_label:
+                return conn.execute(
+                    "DELETE FROM acl_entries WHERE identity_pubkey = ? AND identity_label = ?",
+                    (identity_pubkey.lower(), identity_label),
+                ).rowcount
             return conn.execute(
                 "DELETE FROM acl_entries WHERE identity_pubkey = ?",
                 (identity_pubkey.lower(),),

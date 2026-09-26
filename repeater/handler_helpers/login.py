@@ -438,17 +438,47 @@ class LoginHelper:
         if live is not None:
             live.move_store(new_pubkey_hex, label, commit)
             return
-        move_identity_acl(self.sqlite_handler, old_pubkey_hex, new_pubkey_hex, label, commit)
+        move_identity_acl(
+            self.sqlite_handler,
+            old_pubkey_hex,
+            new_pubkey_hex,
+            acl_identity_label(old_name, "room_server"),
+            label,
+            commit,
+        )
 
     def forget_identity_acl(self, name: str, pubkey_hex: str) -> int:
         """Drop a deleted identity's stored ACL, and stop its live ACL writing it back."""
+        from repeater.handler_helpers.acl import acl_identity_label
+
         live = self.acls_by_name.get(name)
         if live is not None and live.store_key == pubkey_hex.lower():
             live.detach_store()
             self._drop_acl(live)
         if self.sqlite_handler is None:
             return 0
-        return self.sqlite_handler.delete_acl_identity(pubkey_hex)
+        return self.sqlite_handler.delete_acl_identity(
+            pubkey_hex, acl_identity_label(name, "room_server")
+        )
+
+    def unregister_identity(self, identity) -> bool:
+        """Stop answering logins for ``identity``: it was deleted or given a new key.
+
+        Only its own handler goes; another identity now registered on the
+        same hash byte keeps its. Its ACL is detached and unlisted.
+        """
+        pubkey = identity.get_public_key()
+        hash_byte = pubkey[0]
+        handler = self.handlers.get(hash_byte)
+        owner = getattr(handler, "local_identity", None)
+        removed = False
+        if owner is not None and owner.get_public_key() == pubkey:
+            del self.handlers[hash_byte]
+            removed = True
+        for acl in {a for a in self.acls.values() if a.identity_pubkey_hex == pubkey.hex()}:
+            acl.detach_store()
+            self._drop_acl(acl)
+        return removed
 
     def _drop_acl(self, acl, keep_name: str = None) -> None:
         """Remove ``acl`` from both indexes, except under ``keep_name``."""

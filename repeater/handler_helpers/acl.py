@@ -60,50 +60,73 @@ def acl_identity_label(name: str, identity_type: str) -> str:
     return f"{identity_type}:{name}"
 
 
-def move_identity_acl(store, old_key: str, new_key: str, identity_label: str, commit=None) -> None:
-    """Move an identity's stored ACL to a new key, around committing the new key.
+def move_identity_acl(
+    store,
+    old_key: str,
+    new_key: str,
+    old_label: str,
+    new_label: str,
+    commit=None,
+) -> None:
+    """Move an identity's stored ACL to a new key and label, around committing them.
 
-    Copies the entries to ``new_key``, calls ``commit`` (saving the config
-    that names the new key), then deletes the old entries. Every failure
-    leaves the key the config names holding its entries: if the copy or the
-    commit fails, the old entries are untouched (copies are dropped); if only
-    the final delete fails, the old key keeps a stale copy. A stale copy is
-    replaced when the same change is retried; an identity later created on
-    that key would load it. Raises what the copy or the commit raised.
+    Only entries under ``old_label`` move; others at the old key belong to
+    another identity. For a key change this copies the entries to
+    ``new_key``, calls ``commit`` (saving the config that names the new key),
+    then deletes the old entries. Every failure leaves the key the config
+    names holding its entries: if the copy or the commit fails the old ones
+    are untouched (the copies are dropped); if only the final delete fails,
+    the old key keeps a stale copy, which only an identity with this label
+    and that key would load. Retrying the change replaces a stale copy.
 
-    For a rename (same key) this commits and then relabels the entries.
+    For a rename (same key) the entries are relabelled, then committed, and
+    the old label is put back if the commit fails: an identity loads only
+    entries under its own label, so the label must follow the saved name.
+    Raises what the copy, relabel or commit raised.
     """
     old_key = old_key.lower()
     new_key = new_key.lower()
-    if old_key == new_key or store is None:
+    if store is None:
         if commit is not None:
             commit()
-        if store is not None:
-            try:
-                store.relabel_acl_identity(new_key, identity_label)
-            except Exception as e:
-                logger.warning(f"Could not relabel the ACL of '{identity_label}': {e}")
         return
 
-    store.copy_acl_identity(old_key, new_key, identity_label)
+    if old_key == new_key:
+        if old_label == new_label:
+            if commit is not None:
+                commit()
+            return
+        store.relabel_acl_identity(new_key, old_label, new_label)
+        if commit is not None:
+            try:
+                commit()
+            except Exception:
+                try:
+                    store.relabel_acl_identity(new_key, new_label, old_label)
+                except Exception as e:
+                    logger.warning(f"Could not put back the ACL label of '{old_label}': {e}")
+                raise
+        return
+
+    store.copy_acl_identity(old_key, new_key, old_label, new_label)
     if commit is not None:
         try:
             commit()
         except Exception:
             try:
-                store.delete_acl_identity(new_key)
+                store.delete_acl_identity(new_key, new_label)
             except Exception as e:
                 logger.warning(
-                    f"Could not drop the ACL copied to {new_key[:8]}...: {e}. Retrying "
-                    f"the change replaces it; a new identity on that key would load it"
+                    f"Could not drop the ACL copied to {new_key[:8]}...: {e}. "
+                    f"Retrying the change replaces it"
                 )
             raise
     try:
-        store.delete_acl_identity(old_key)
+        store.delete_acl_identity(old_key, old_label)
     except Exception as e:
         logger.warning(
             f"Could not drop the ACL left under the old key {old_key[:8]}...: {e}. "
-            f"A new identity on that key would load it"
+            f"Only an identity named '{old_label}' on that key would load it"
         )
 
 
@@ -228,6 +251,7 @@ class ACL:
         try:
             rows = self._store.load_acl_entries(
                 self._store_key,
+                identity_label=self._identity_label or None,
                 adopt_label=self._identity_label if self._adopt_by_label else None,
             )
         except Exception as e:
@@ -292,6 +316,7 @@ class ACL:
                 self._store if self._persistence_enabled() else None,
                 self._store_key or new_key,
                 new_key,
+                self._identity_label,
                 identity_label,
                 commit,
             )

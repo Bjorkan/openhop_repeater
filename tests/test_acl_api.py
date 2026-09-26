@@ -581,3 +581,39 @@ def test_a_hot_reload_names_the_room_it_replaces(db, request_ctx):
     request_ctx.json = {"name": "room-a", "new_name": "room-b"}
     api.update_identity()
     assert daemon._register_identity_everywhere.call_args.kwargs["previous_name"] == "room-a"
+
+
+def test_a_rekey_stops_the_old_key_answering_logins(db, request_ctx):
+    daemon = _LiveDaemon(db, "room-a", "11" * 32)
+    old_hash = LocalIdentity(seed=bytes.fromhex("11" * 32)).get_public_key()[0]
+    new_seed = "22" * 32
+    while LocalIdentity(seed=bytes.fromhex(new_seed)).get_public_key()[0] == old_hash:
+        new_seed = new_seed[2:] + "33"
+    daemon._unregister_identity_everywhere = lambda identity: (
+        daemon.login_helper.unregister_identity(identity)
+    )
+    api = _api(daemon, daemon.config)
+    assert old_hash in daemon.login_helper.handlers
+
+    request_ctx.method = "PUT"
+    request_ctx.json = {"name": "room-a", "identity_key": new_seed}
+    assert "applied immediately" in api.update_identity()["message"]
+
+    assert old_hash not in daemon.login_helper.handlers
+    new_hash = LocalIdentity(seed=bytes.fromhex(new_seed)).get_public_key()[0]
+    assert new_hash in daemon.login_helper.handlers
+
+
+def test_deleting_a_room_stops_it_answering_logins(db, request_ctx):
+    daemon = _LiveDaemon(db, "room-a", "11" * 32)
+    room_hash = LocalIdentity(seed=bytes.fromhex("11" * 32)).get_public_key()[0]
+    daemon._unregister_identity_everywhere = lambda identity: (
+        daemon.login_helper.unregister_identity(identity)
+    )
+    api = _api(daemon, daemon.config)
+
+    request_ctx.method = "DELETE"
+    result = api.delete_identity(name="room-a", type="room_server")
+    assert "deactivated immediately" in result["message"]
+    assert room_hash not in daemon.login_helper.handlers
+    assert daemon.login_helper.get_acl_by_name("room-a") is None

@@ -370,7 +370,10 @@ def test_moving_onto_a_key_that_has_entries_is_refused(db):
 
     with pytest.raises(ValueError):
         db.copy_acl_identity(
-            old_key.get_public_key().hex(), new_key.get_public_key().hex(), "room_server:room-a"
+            old_key.get_public_key().hex(),
+            new_key.get_public_key().hex(),
+            "room_server:room-a",
+            "room_server:room-a",
         )
     assert sorted(r["identity_pubkey"] for r in _acl_rows(db)) == sorted(
         [old_key.get_public_key().hex(), new_key.get_public_key().hex()]
@@ -448,7 +451,7 @@ class _FailingStore:
     def __init__(self, rows=()):
         self.rows = list(rows)
 
-    def load_acl_entries(self, identity_pubkey, adopt_label=None):
+    def load_acl_entries(self, identity_pubkey, identity_label=None, adopt_label=None):
         return list(self.rows)
 
     def upsert_acl_entry(self, *args):
@@ -798,7 +801,8 @@ def test_a_failed_commit_and_cleanup_still_leave_the_old_key_whole(db):
             db,
             old_key.get_public_key().hex(),
             new_key.get_public_key().hex(),
-            "room_server:a",
+            "room_server:room-a",
+            "room_server:room-a",
             commit,
         )
     db.delete_acl_identity = real_delete
@@ -948,10 +952,71 @@ def test_a_change_retried_after_a_failed_cleanup_goes_through(db):
             old_key.get_public_key().hex(),
             new_key.get_public_key().hex(),
             label,
+            label,
             failing_commit,
         )
     db.delete_acl_identity = real_delete
 
-    move_identity_acl(db, old_key.get_public_key().hex(), new_key.get_public_key().hex(), label)
+    move_identity_acl(
+        db, old_key.get_public_key().hex(), new_key.get_public_key().hex(), label, label
+    )
     assert {r["identity_pubkey"] for r in _acl_rows(db)} == {new_key.get_public_key().hex()}
     assert len(_acl_rows(db)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Round-5 review (codex): rows are owned by key *and* label
+# ---------------------------------------------------------------------------
+
+
+def test_a_room_does_not_load_another_rooms_orphaned_rows(db):
+    # room-a's admin left at key K by a failed cleanup; room-b later created on K.
+    key = LocalIdentity()
+    admin = LocalIdentity()
+    _cli(_room_acl(db, key, "room-a"))._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+
+    room_b = _room_acl(db, key, "room-b")
+    assert room_b.load() == 0
+    # A blank-password login gets no stored grant (at most a read-only guest).
+    assert _login(room_b, admin, "", 1)[1] == PERM_ACL_GUEST
+
+
+def test_a_rekey_carries_only_the_rooms_own_rows(db):
+    old_key, new_key = LocalIdentity(), LocalIdentity()
+    own, orphan = LocalIdentity(), LocalIdentity()
+    _cli(_room_acl(db, old_key, "room-a"))._cmd_setperm(f"setperm {own.get_public_key().hex()} 3")
+    _cli(_room_acl(db, old_key, "gone"))._cmd_setperm(f"setperm {orphan.get_public_key().hex()} 3")
+    from repeater.handler_helpers.acl import move_identity_acl
+
+    label = acl_identity_label("room-a", "room_server")
+    move_identity_acl(
+        db, old_key.get_public_key().hex(), new_key.get_public_key().hex(), label, label
+    )
+
+    moved = _room_acl(db, new_key, "room-a")
+    assert moved.load() == 1
+    assert moved.get_client(own.get_public_key()) is not None
+    assert moved.get_client(orphan.get_public_key()) is None
+
+
+def test_a_rename_relabels_before_the_save_and_back_if_it_fails(db):
+    key = LocalIdentity()
+    admin = LocalIdentity()
+    _cli(_room_acl(db, key, "room-a"))._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+    from repeater.handler_helpers.acl import move_identity_acl
+
+    old = acl_identity_label("room-a", "room_server")
+    new = acl_identity_label("room-b", "room_server")
+
+    def failing_commit():
+        raise OSError("config not written")
+
+    with pytest.raises(OSError):
+        move_identity_acl(
+            db, key.get_public_key().hex(), key.get_public_key().hex(), old, new, failing_commit
+        )
+    assert _room_acl(db, key, "room-a").load() == 1
+
+    move_identity_acl(db, key.get_public_key().hex(), key.get_public_key().hex(), old, new)
+    assert _room_acl(db, key, "room-b").load() == 1
+    assert _room_acl(db, key, "room-a").load() == 0
