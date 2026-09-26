@@ -457,9 +457,9 @@ class LoginHelper:
             self._drop_acl(live)
         if self.sqlite_handler is None:
             return 0
-        return self.sqlite_handler.delete_acl_identity(
-            pubkey_hex, acl_identity_label(name, "room_server")
-        )
+        # Every key: a rekey whose cleanup failed left rows under this label at
+        # the old one. Names are unique, so no other room holds this label.
+        return self.sqlite_handler.delete_acl_label(acl_identity_label(name, "room_server"))
 
     def unregister_identity(self, identity) -> bool:
         """Stop answering logins for ``identity``: it was deleted or given a new key.
