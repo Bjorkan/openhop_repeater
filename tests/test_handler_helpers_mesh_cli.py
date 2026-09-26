@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from repeater.handler_helpers.mesh_cli import MeshCLI
 
 
@@ -306,14 +308,16 @@ def test_misc_commands_and_routes():
     assert cli._cmd_tempradio("tempradio 915 125 7 5 nope") == "Error, invalid params"
     assert cli._cmd_tempradio("tempradio 915 125 7 5 10").startswith("Error:")
 
-    assert cli._cmd_neighbor_remove("neighbor.remove") == "ERR: Missing pubkey"
+    assert cli._cmd_neighbor_remove("neighbor.remove") == (
+        "ERR: Missing pubkey. Do you mean `neighbor.remove all`?"
+    )
 
     storage = SimpleNamespace(delete_neighbors_by_pubkey_prefix=MagicMock(return_value=1))
     cli.storage_handler = storage
-    assert cli._cmd_neighbor_remove("neighbor.remove abc") == "OK"
-    storage.delete_neighbors_by_pubkey_prefix.assert_called_with("abc")
+    assert cli._cmd_neighbor_remove("neighbor.remove abcd") == "OK"
+    storage.delete_neighbors_by_pubkey_prefix.assert_called_with("abcd")
 
-    assert cli._cmd_neighbor_remove("neighbor.remove    ") == "OK"
+    assert cli._cmd_neighbor_remove("neighbor.remove all") == "OK"
     storage.delete_neighbors_by_pubkey_prefix.assert_called_with(None)
 
     assert cli._cmd_neighbor_remove("neighbor.remove zz") == "ERR: bad pubkey"
@@ -701,3 +705,61 @@ def test_cli_set_commands_persist_with_real_config_manager(tmp_path):
     assert saved["delays"]["rx_delay_base"] == 4.5
     assert saved["delays"]["tx_delay_factor"] == 1.5
     assert saved["delays"]["direct_tx_delay_factor"] == 0.25
+
+
+def _neighbor_cli():
+    cli = MeshCLI("/tmp/cfg.yaml", _base_config(), _cfg_mgr())
+    storage = SimpleNamespace(delete_neighbors_by_pubkey_prefix=MagicMock(return_value=1))
+    cli.storage_handler = storage
+    return cli, storage.delete_neighbors_by_pubkey_prefix
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["neighbor.remove", "neighbor.remove ", "neighbor.remove    ", "ab|neighbor.remove "],
+)
+def test_neighbor_remove_without_a_key_hints_at_remove_all(command):
+    """handle_command strips the line, so a trailing space or spaces-only key
+    arrives as a bare "neighbor.remove". Firmware would clear every neighbour
+    for an empty key (CommonCLI.cpp:241-251); here that needs an explicit
+    `neighbor.remove all`, and nothing is deleted."""
+    cli, delete = _neighbor_cli()
+    reply = cli.handle_command(b"\x00" * 32, command, True)
+
+    assert reply.endswith("ERR: Missing pubkey. Do you mean `neighbor.remove all`?")
+    assert reply.startswith("ab|") == command.startswith("ab|")
+    delete.assert_not_called()
+
+
+def test_neighbor_remove_all_clears_every_neighbor():
+    cli, delete = _neighbor_cli()
+    assert cli.handle_command(b"\x00" * 32, "neighbor.remove all", True) == "OK"
+    delete.assert_called_once_with(None)
+
+
+@pytest.mark.parametrize("key", ["ab", "ABCD", "a1" * 32])
+def test_neighbor_remove_takes_a_whole_byte_hex_prefix_up_to_32_bytes(key):
+    cli, delete = _neighbor_cli()
+    assert cli.handle_command(b"\x00" * 32, f"neighbor.remove {key}", True) == "OK"
+    delete.assert_called_once_with(key)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "abc",  # odd length: firmware fromHex needs whole bytes
+        "a1" * 32 + "ff",  # 33 bytes: firmware caps at PUB_KEY_SIZE*2 hex chars
+        "zz",  # not hex (firmware is laxer here; openhop refuses)
+        "ALL",  # only lowercase `all` means everything
+        "all ab",
+    ],
+)
+def test_neighbor_remove_rejects_a_malformed_key(key):
+    cli, delete = _neighbor_cli()
+    assert cli.handle_command(b"\x00" * 32, f"neighbor.remove {key}", True) == "ERR: bad pubkey"
+    delete.assert_not_called()
+
+
+def test_neighbor_remove_help_lists_remove_all():
+    cli, _ = _neighbor_cli()
+    assert "neighbor.remove all" in cli.handle_command(b"\x00" * 32, "help", True)
