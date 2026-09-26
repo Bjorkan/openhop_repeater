@@ -1248,7 +1248,9 @@ class MeshCLI:
                 # Only what `neighbors` lists (firmware clears its neighbour
                 # table), not every advert: companions, rooms and multi-hop
                 # nodes stay.
-                for pubkey in self._zero_hop_repeaters(self.storage_handler.get_neighbors() or {}):
+                # raise_errors: a failed read must not pass for "no neighbours".
+                neighbors = self.storage_handler.get_neighbors(raise_errors=True)
+                for pubkey in self._zero_hop_repeaters(neighbors or {}):
                     delete_fn(pubkey)
             else:
                 delete_fn(pubkey_hex)

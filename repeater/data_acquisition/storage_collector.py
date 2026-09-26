@@ -797,8 +797,8 @@ class StorageCollector:
     def get_route_stats(self, hours: int = 24, radio_profiles: Optional[list] = None) -> dict:
         return self.sqlite_handler.get_route_stats(hours, radio_profiles=radio_profiles)
 
-    def get_neighbors(self) -> dict:
-        return self.sqlite_handler.get_neighbors()
+    def get_neighbors(self, *, raise_errors: bool = False) -> dict:
+        return self.sqlite_handler.get_neighbors(raise_errors=raise_errors)
 
     def get_neighbor_scopes(self) -> dict:
         return self.sqlite_handler.get_neighbor_scopes()

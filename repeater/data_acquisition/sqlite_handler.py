@@ -3602,7 +3602,7 @@ class SQLiteHandler:
             logger.error(f"Failed to get route stats from SQLite: {e}")
             return {"error": str(e), "data_source": "error"}
 
-    def get_neighbors(self) -> dict:
+    def get_neighbors(self, *, raise_errors: bool = False) -> dict:
         try:
             now = time.time()
             cached = self._neighbors_cache.get("value")
@@ -3651,6 +3651,8 @@ class SQLiteHandler:
 
         except Exception as e:
             logger.error(f"Failed to get neighbors: {e}")
+            if raise_errors:
+                raise
             return {}
 
     def get_noise_floor_history(
