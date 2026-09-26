@@ -337,3 +337,82 @@ def test_acl_info_uses_the_right_acl_when_hashes_collide(db, request_ctx):
     assert acls["room-a"]["acl_entries"] == 1
     assert acls["room-a"]["has_admin_password"] is True
     assert acls["repeater"]["store_error"] is None
+
+
+def test_a_refused_update_leaves_the_live_config_unchanged(db, request_ctx):
+    daemon, config, old_identity, admin = _room_update_setup(db)
+    api = _api(daemon, config)
+    before = dict(config["identities"]["room_servers"][0], settings=dict(ROOM_SETTINGS))
+
+    request_ctx.method = "PUT"
+    request_ctx.json = {
+        "name": "room-a",
+        "new_name": "renamed",
+        "settings": {"admin_password": "same", "guest_password": "same"},
+    }
+    assert api.update_identity()["success"] is False
+    assert config["identities"]["room_servers"][0] == before
+
+
+def test_a_key_change_with_no_store_is_refused(request_ctx):
+    config = {
+        "identities": {
+            "room_servers": [{"name": "room-a", "identity_key": "11" * 32, "settings": {}}]
+        }
+    }
+    api = _api(SimpleNamespace(), config)
+    request_ctx.method = "PUT"
+    request_ctx.json = {"name": "room-a", "identity_key": "22" * 32}
+    result = api.update_identity()
+    assert result["success"] is False
+    assert "no ACL store" in result["error"]
+    api.config_manager.save_to_file.assert_not_called()
+
+
+def test_a_room_without_an_acl_does_not_borrow_one_by_hash(db, request_ctx):
+    daemon = _Daemon(db, [])
+    twin = LocalIdentity()
+    while twin.get_public_key()[0] != daemon.local_identity.get_public_key()[0]:
+        twin = LocalIdentity()
+    # Registered with the identity manager but, having no passwords, not for logins.
+    daemon.rooms.append(("room-b", twin, {"name": "room-b", "settings": {}}))
+    api = _api(daemon)
+
+    names = [a["name"] for a in api.acl_info()["data"]["acls"]]
+    assert names == ["repeater"]
+    result = _post(
+        request_ctx,
+        api.acl_set_permissions,
+        {
+            "identity_name": "room-b",
+            "client_pubkey": LocalIdentity().get_public_key().hex(),
+            "permissions": 3,
+        },
+    )
+    assert result["success"] is False
+
+
+def test_acl_clients_reports_an_unreadable_store(db, request_ctx):
+    daemon = _Daemon(db, [])
+    daemon.login_helper.get_acl_by_name("repeater").load_error = "database is locked"
+    api = _api(daemon)
+    data = api.acl_clients()["data"]
+    assert data["store_errors"] == {"repeater": "database is locked"}
+
+
+def test_remove_from_every_acl_reports_which_failed(db, request_ctx):
+    from repeater.handler_helpers.acl import ACLStoreError
+
+    daemon = _Daemon(db, [("room-a", LocalIdentity())])
+    key = LocalIdentity().get_public_key()
+    for name in ("repeater", "room-a"):
+        daemon.login_helper.get_acl_by_name(name).apply_permissions(key, 3)
+    daemon.login_helper.get_acl_by_name("room-a").remove_client = MagicMock(
+        side_effect=ACLStoreError("disk full")
+    )
+    api = _api(daemon)
+
+    result = _post(request_ctx, api.acl_remove_client, {"client_pubkey": key.hex()})
+    assert result["success"] is False
+    assert "room-a (disk full)" in result["error"]
+    assert "removed from repeater" in result["error"]

@@ -60,6 +60,52 @@ def acl_identity_label(name: str, identity_type: str) -> str:
     return f"{identity_type}:{name}"
 
 
+def move_identity_acl(store, old_key: str, new_key: str, identity_label: str, commit=None) -> None:
+    """Move an identity's stored ACL to a new key, around committing the new key.
+
+    Copies the entries to ``new_key``, calls ``commit`` (saving the config
+    that names the new key), then deletes the old entries. Every failure
+    leaves the key the config names holding its entries: if the copy or the
+    commit fails, the old entries are untouched (copies are dropped); if only
+    the final delete fails, the old key keeps a stale copy that no identity
+    loads. Raises what the copy or the commit raised.
+
+    For a rename (same key) this commits and then relabels the entries.
+    """
+    old_key = old_key.lower()
+    new_key = new_key.lower()
+    if old_key == new_key or store is None:
+        if commit is not None:
+            commit()
+        if store is not None:
+            try:
+                store.relabel_acl_identity(new_key, identity_label)
+            except Exception as e:
+                logger.warning(f"Could not relabel the ACL of '{identity_label}': {e}")
+        return
+
+    store.copy_acl_identity(old_key, new_key, identity_label)
+    if commit is not None:
+        try:
+            commit()
+        except Exception:
+            try:
+                store.delete_acl_identity(new_key)
+            except Exception as e:
+                logger.warning(
+                    f"Could not drop the ACL copied to {new_key[:8]}...: {e}; "
+                    f"no identity uses that key, so it is not loaded"
+                )
+            raise
+    try:
+        store.delete_acl_identity(old_key)
+    except Exception as e:
+        logger.warning(
+            f"Could not drop the ACL left under the old key {old_key[:8]}...: {e}; "
+            f"no identity uses that key, so it is not loaded"
+        )
+
+
 class ClientInfo:
     """Represents an authenticated client in the access control list."""
 
@@ -139,6 +185,7 @@ class ACL:
         # Set when load() could not read the store: the table is then not the
         # stored one, and the web API says so rather than showing it as empty.
         self.load_error: Optional[str] = None
+        self._detached = False
 
     # ------------------------------------------------------------------
     # Persistence
@@ -158,52 +205,62 @@ class ACL:
             return b""
 
     def load(self) -> int:
-        """Fill a new table from the store. Returns the number of entries loaded.
+        """Fill the table from the store. Returns the number of entries loaded.
 
-        Call once, on a fresh ACL: loaded entries replace live ones. They have
-        ``last_activity`` 0, as in firmware: known, not active, until the
-        client logs in again. The replay watermark also starts at 0, as
-        firmware keeps it in RAM only.
+        Loaded entries have ``last_activity`` 0, as in firmware: known, not
+        active, until the client logs in again. The replay watermark also
+        starts at 0, as firmware keeps it in RAM only.
 
         Every stored entry is loaded even past ``max_clients``: lowering the
         limit must not silently revoke provisioned grants. An over-full table
         still evicts non-admins for newcomers and refuses once all are admins.
+
+        A failed read is recorded in ``load_error`` and retried by the next
+        login or change, so stored keys work again once the store recovers.
         """
+        with self._lock:
+            return self._load_locked()
+
+    def _load_locked(self) -> int:
         if not self._persistence_enabled():
             return 0
-        with self._lock:
-            try:
-                rows = self._store.load_acl_entries(
-                    self._store_key,
-                    adopt_label=self._identity_label if self._adopt_by_label else None,
-                )
-            except Exception as e:
-                self.load_error = str(e)
-                logger.error(
-                    f"Failed to load the stored ACL for '{self._identity_label}': {e}. "
-                    f"Stored entries cannot log in until it loads."
-                )
-                return 0
-            self.load_error = None
+        try:
+            rows = self._store.load_acl_entries(
+                self._store_key,
+                adopt_label=self._identity_label if self._adopt_by_label else None,
+            )
+        except Exception as e:
+            self.load_error = str(e)
+            logger.error(
+                f"Failed to load the stored ACL for '{self._identity_label}': {e}. "
+                f"Stored entries cannot log in until it loads."
+            )
+            return 0
+        self.load_error = None
 
-            loaded = 0
-            for row in rows:
-                try:
-                    pub_key = bytes.fromhex(row["client_pubkey"])
-                    permissions = int(row["permissions"]) & 0xFF
-                    if len(pub_key) != PUB_KEY_SIZE or permissions == 0:
-                        continue
-                    identity = Identity(pub_key)
-                except Exception:
-                    logger.warning(
-                        f"Skipping malformed ACL row for '{self._identity_label}': {row}"
-                    )
+        loaded = 0
+        for row in rows:
+            try:
+                pub_key = bytes.fromhex(row["client_pubkey"])
+                permissions = int(row["permissions"]) & 0xFF
+                if len(pub_key) != PUB_KEY_SIZE or permissions == 0:
                     continue
+                identity = Identity(pub_key)
+            except Exception:
+                logger.warning(f"Skipping malformed ACL row for '{self._identity_label}': {row}")
+                continue
+            self._persisted[pub_key] = permissions
+            live = self.clients.get(pub_key)
+            if live is not None:
+                # Joined while the store could not be read (a retried load).
+                # Keep the session; a guest session takes its stored grant.
+                if live.permissions == 0:
+                    live.permissions = permissions
+            else:
                 client = ClientInfo(identity, permissions)
                 client.shared_secret = self._derive_secret(pub_key)
                 self.clients[pub_key] = client
-                self._persisted[pub_key] = permissions
-                loaded += 1
+            loaded += 1
 
         if loaded:
             logger.info(
@@ -216,21 +273,46 @@ class ACL:
             )
         return loaded
 
-    def move_store(self, identity_pubkey_hex: str, identity_label: str) -> int:
+    def _retry_failed_load_locked(self) -> None:
+        if self.load_error is not None:
+            self._load_locked()
+
+    def move_store(self, identity_pubkey_hex: str, identity_label: str, commit=None) -> None:
         """Move the stored entries to a new identity key and label, and write there after.
 
-        Holds the lock across the move, so a change cannot be written under the
-        old key after its rows have gone. Raises when the store refuses; the
-        ACL then still writes where it did.
+        See ``move_identity_acl``. Holds the lock throughout, so no change can
+        be written under the old key after its rows have gone, or lost while
+        the config is committed. The live identity is unchanged, so
+        ``identity_pubkey_hex`` still names the key secrets are derived with.
         """
         new_key = identity_pubkey_hex.lower()
         with self._lock:
-            moved = 0
-            if self._persistence_enabled():
-                moved = self._store.move_acl_identity(self._store_key, new_key, identity_label)
+            move_identity_acl(
+                self._store if self._persistence_enabled() else None,
+                self._store_key or new_key,
+                new_key,
+                identity_label,
+                commit,
+            )
             self._store_key = new_key
             self._identity_label = identity_label
-            return moved
+
+    def update_settings(
+        self,
+        max_clients: int,
+        admin_password: Optional[str],
+        guest_password: Optional[str],
+        allow_read_only: bool,
+        identity_label: Optional[str] = None,
+    ) -> None:
+        """Apply new security settings in one step, so a login never sees half of them."""
+        with self._lock:
+            self.max_clients = max_clients
+            self.admin_password = admin_password or ""
+            self.guest_password = guest_password or ""
+            self.allow_read_only = allow_read_only
+            if identity_label is not None:
+                self._identity_label = identity_label
 
     def set_label(self, identity_label: str) -> None:
         """The label written with later changes, as after a rename."""
@@ -238,7 +320,7 @@ class ACL:
             self._identity_label = identity_label
 
     def detach_store(self) -> None:
-        """Stop writing to the store: the identity was deleted.
+        """Stop writing to the store: the identity was deleted or replaced.
 
         Its handlers stay registered until a restart, and a login there must
         not write back the entries the delete removed.
@@ -246,6 +328,13 @@ class ACL:
         with self._lock:
             self._store = None
             self._persisted.clear()
+            self.load_error = None
+            self._detached = True
+
+    @property
+    def detached(self) -> bool:
+        """True once detach_store() has run: this ACL no longer owns stored rows."""
+        return self._detached
 
     @property
     def store_key(self) -> Optional[str]:
@@ -348,6 +437,7 @@ class ACL:
         permissions &= 0xFF
         pub_key = bytes(pub_key)
         with self._lock:
+            self._retry_failed_load_locked()
             if role_of(permissions) == PERM_ACL_GUEST:
                 # Firmware matches an empty prefix against the first entry and
                 # deletes it. Refuse instead: "setperm  0" should not drop someone.
@@ -441,6 +531,7 @@ class ACL:
         target_identity_config: dict = None,
     ) -> tuple[bool, int]:
         with self._lock:
+            self._retry_failed_load_locked()
             return self._authenticate_client_locked(
                 client_identity,
                 shared_secret,
@@ -588,6 +679,7 @@ class ACL:
         """Remove an entry, and its stored copy. Raises ACLStoreError, restoring it, on failure."""
         key = pub_key[:PUB_KEY_SIZE]
         with self._lock:
+            self._retry_failed_load_locked()
             removed = self.clients.pop(key, None)
             if removed is None:
                 return False

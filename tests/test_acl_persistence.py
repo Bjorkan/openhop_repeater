@@ -342,7 +342,9 @@ def test_a_room_renamed_and_rekeyed_in_one_update_keeps_its_acl(db):
     live = helper.get_acl_by_name("old-name")
     _cli(live)._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
 
-    helper.move_room_acl(old_key.get_public_key().hex(), new_key.get_public_key().hex(), "new-name")
+    helper.move_room_acl(
+        "old-name", old_key.get_public_key().hex(), new_key.get_public_key().hex(), "new-name"
+    )
 
     rows = _acl_rows(db)
     assert [(r["identity_pubkey"], r["identity_label"]) for r in rows] == [
@@ -367,7 +369,7 @@ def test_moving_onto_a_key_that_has_entries_is_refused(db):
     _cli(_room_acl(db, new_key))._cmd_setperm(f"setperm {other.get_public_key().hex()} 3")
 
     with pytest.raises(ValueError):
-        db.move_acl_identity(
+        db.copy_acl_identity(
             old_key.get_public_key().hex(), new_key.get_public_key().hex(), "room_server:room-a"
         )
     assert sorted(r["identity_pubkey"] for r in _acl_rows(db)) == sorted(
@@ -388,7 +390,9 @@ def test_a_move_racing_a_grant_does_not_strand_it_under_the_old_key(db):
 
     thread = threading.Thread(target=grant)
     thread.start()
-    helper.move_room_acl(old_key.get_public_key().hex(), new_key.get_public_key().hex(), "room-a")
+    helper.move_room_acl(
+        "room-a", old_key.get_public_key().hex(), new_key.get_public_key().hex(), "room-a"
+    )
     thread.join()
 
     assert {r["identity_pubkey"] for r in _acl_rows(db)} == {new_key.get_public_key().hex()}
@@ -405,7 +409,7 @@ def test_a_deleted_identity_does_not_write_its_acl_back(db):
     acl = helper.get_acl_by_name("room-a")
     _cli(acl)._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
 
-    assert helper.forget_identity_acl(local.get_public_key().hex()) == 1
+    assert helper.forget_identity_acl("room-a", local.get_public_key().hex()) == 1
     _login(acl, LocalIdentity(), "roomadmin", 1, ROOM_CFG)
     _cli(acl)._cmd_setperm(f"setperm {LocalIdentity().get_public_key().hex()} 3")
     acl.remove_client(admin.get_public_key())
@@ -626,7 +630,9 @@ def test_a_rekeyed_identity_gets_a_fresh_acl_on_its_new_key(db):
     helper = _login_helper(db)
     helper.register_identity("room-a", old_key, identity_type="room_server", config=ROOM_CFG)
     _cli(helper.get_acl_by_name("room-a"))._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
-    helper.move_room_acl(old_key.get_public_key().hex(), new_key.get_public_key().hex(), "room-a")
+    helper.move_room_acl(
+        "room-a", old_key.get_public_key().hex(), new_key.get_public_key().hex(), "room-a"
+    )
 
     # Same hash byte, different key: not reused, so secrets use the new key.
     helper.register_identity("room-a", new_key, identity_type="room_server", config=ROOM_CFG)
@@ -741,3 +747,181 @@ async def test_room_sync_loop_does_not_push_to_an_entry_that_has_not_logged_in(m
     except asyncio.CancelledError:
         pass
     db.get_unsynced_messages.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# Round-3 review: moves around a commit, one ACL per identity, load retry
+# ---------------------------------------------------------------------------
+
+
+def test_a_failed_commit_leaves_the_entries_under_the_old_key(db):
+    old_key, new_key = LocalIdentity(), LocalIdentity()
+    admin = LocalIdentity()
+    helper = _login_helper(db)
+    helper.register_identity("room-a", old_key, identity_type="room_server", config=ROOM_CFG)
+    live = helper.get_acl_by_name("room-a")
+    _cli(live)._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+
+    def commit():
+        raise OSError("config not written")
+
+    with pytest.raises(OSError):
+        helper.move_room_acl(
+            "room-a",
+            old_key.get_public_key().hex(),
+            new_key.get_public_key().hex(),
+            "room-a",
+            commit,
+        )
+    assert {r["identity_pubkey"] for r in _acl_rows(db)} == {old_key.get_public_key().hex()}
+    # The live ACL still writes where the config still points.
+    _cli(live)._cmd_setperm(f"setperm {LocalIdentity().get_public_key().hex()} 3")
+    assert {r["identity_pubkey"] for r in _acl_rows(db)} == {old_key.get_public_key().hex()}
+
+
+def test_a_failed_commit_and_cleanup_still_leave_the_old_key_whole(db):
+    # The worst case: the config save fails and so does dropping the copies.
+    # The config still names the old key, which still has every entry.
+    old_key, new_key = LocalIdentity(), LocalIdentity()
+    admin = LocalIdentity()
+    _cli(_room_acl(db, old_key))._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+    real_delete = db.delete_acl_identity
+    db.delete_acl_identity = MagicMock(side_effect=RuntimeError("disk gone"))
+
+    def commit():
+        raise OSError("config not written")
+
+    from repeater.handler_helpers.acl import move_identity_acl
+
+    with pytest.raises(OSError):
+        move_identity_acl(
+            db,
+            old_key.get_public_key().hex(),
+            new_key.get_public_key().hex(),
+            "room_server:a",
+            commit,
+        )
+    db.delete_acl_identity = real_delete
+    assert _room_acl(db, old_key).load() == 1
+
+
+def test_a_grant_after_a_move_lands_under_the_new_key(db):
+    old_key, new_key = LocalIdentity(), LocalIdentity()
+    helper = _login_helper(db)
+    helper.register_identity("room-a", old_key, identity_type="room_server", config=ROOM_CFG)
+    live = helper.get_acl_by_name("room-a")
+    helper.move_room_acl(
+        "room-a", old_key.get_public_key().hex(), new_key.get_public_key().hex(), "room-a"
+    )
+
+    _cli(live)._cmd_setperm(f"setperm {LocalIdentity().get_public_key().hex()} 3")
+    assert {r["identity_pubkey"] for r in _acl_rows(db)} == {new_key.get_public_key().hex()}
+
+
+def test_a_rekeyed_identity_leaves_one_acl_and_moves_again_by_name(db):
+    # Two rekeys without a restart: the second must move the live ACL's rows,
+    # not those of the ACL the first re-registration replaced.
+    keys = [LocalIdentity() for _ in range(3)]
+    while keys[1].get_public_key()[0] == keys[0].get_public_key()[0]:
+        keys[1] = LocalIdentity()
+    admin = LocalIdentity()
+    helper = _login_helper(db)
+    helper.register_identity("room-a", keys[0], identity_type="room_server", config=ROOM_CFG)
+    first = helper.get_acl_by_name("room-a")
+    _cli(first)._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+
+    helper.move_room_acl(
+        "room-a", keys[0].get_public_key().hex(), keys[1].get_public_key().hex(), "room-a"
+    )
+    helper.register_identity("room-a", keys[1], identity_type="room_server", config=ROOM_CFG)
+    second = helper.get_acl_by_name("room-a")
+    assert second is not first
+    assert first.detached
+    assert first not in helper.acls.values()
+
+    helper.move_room_acl(
+        "room-a", keys[1].get_public_key().hex(), keys[2].get_public_key().hex(), "room-a"
+    )
+    _cli(second)._cmd_setperm(f"setperm {LocalIdentity().get_public_key().hex()} 3")
+    # The replaced ACL no longer writes anywhere.
+    _cli(first)._cmd_setperm(f"setperm {LocalIdentity().get_public_key().hex()} 3")
+    assert {r["identity_pubkey"] for r in _acl_rows(db)} == {keys[2].get_public_key().hex()}
+    assert len(_acl_rows(db)) == 2
+
+
+def test_a_room_deleted_and_re_added_with_its_key_persists_again(db):
+    local = LocalIdentity()
+    helper = _login_helper(db)
+    helper.register_identity("room-a", local, identity_type="room_server", config=ROOM_CFG)
+    helper.forget_identity_acl("room-a", local.get_public_key().hex())
+
+    helper.register_identity("room-a", local, identity_type="room_server", config=ROOM_CFG)
+    acl = helper.get_acl_by_name("room-a")
+    assert not acl.detached
+    admin = LocalIdentity()
+    _cli(acl)._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+    assert acl.is_persisted(admin.get_public_key())
+    assert len(_acl_rows(db)) == 1
+
+
+def test_a_failed_load_is_retried_by_the_next_login(db):
+    local = LocalIdentity()
+    admin = LocalIdentity()
+    _cli(_repeater_acl(db, local))._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+
+    real_load = db.load_acl_entries
+    db.load_acl_entries = MagicMock(side_effect=RuntimeError("database is locked"))
+    acl = _repeater_acl(db, local)
+    assert acl.load() == 0
+    assert acl.load_error == "database is locked"
+
+    db.load_acl_entries = real_load
+    assert _login(acl, admin, "", 1) == (True, PERM_ACL_ADMIN)
+    assert acl.load_error is None
+
+
+def test_a_hot_reload_applies_new_settings_to_the_reused_acl(db):
+    local = LocalIdentity()
+    helper = _login_helper(db)
+    helper.register_identity("room-a", local, identity_type="room_server", config=ROOM_CFG)
+    acl = helper.get_acl_by_name("room-a")
+    changed = {
+        "type": "room_server",
+        "settings": {"admin_password": "new-admin", "guest_password": "rg", "max_clients": 7},
+    }
+    helper.register_identity("room-a", local, identity_type="room_server", config=changed)
+    assert helper.get_acl_by_name("room-a") is acl
+    assert (acl.admin_password, acl.max_clients) == ("new-admin", 7)
+
+
+@pytest.mark.asyncio
+async def test_room_eviction_carries_on_past_a_failed_store_write():
+    acl = ACL(max_clients=5, admin_password="roomadmin")
+    first, second = LocalIdentity(), LocalIdentity()
+    for client in (first, second):
+        _login(acl, client, "roomguest", 1, ROOM_CFG)
+    calls = []
+
+    def remove(pub_key):
+        calls.append(pub_key)
+        if len(calls) == 1:
+            raise ACLStoreError("disk full")
+        return True
+
+    acl.remove_client = remove
+    stale = time.time() - 10_000
+    db = SimpleNamespace(
+        get_all_room_clients=MagicMock(
+            return_value=[
+                {
+                    "client_pubkey": c.get_public_key().hex(),
+                    "push_failures": 0,
+                    "last_activity": stale,
+                }
+                for c in (first, second)
+            ]
+        ),
+        upsert_client_sync=MagicMock(),
+    )
+    await _room_server(acl, db)._evict_failed_clients()
+    assert len(calls) == 2
