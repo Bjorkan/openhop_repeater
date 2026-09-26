@@ -4843,8 +4843,8 @@ class SQLiteHandler:
         public key are taken over when this key has none: the identity was
         given a new key and its admins keep access, as with firmware's ACL
         after a new private key. Only an identity that is unique by label
-        should adopt; the repeater does, room servers move their rows
-        explicitly (``move_acl_identity``) when their key changes.
+        should adopt; the repeater does, room servers have their rows moved
+        explicitly (``acl.move_identity_acl``) when their key changes.
         """
         identity_pubkey = identity_pubkey.lower()
         with self._connect() as conn:
@@ -4910,17 +4910,22 @@ class SQLiteHandler:
 
         The first half of a key change: the old rows stay until the new key is
         committed, so a failure at any step leaves the committed key with its
-        entries. Raises ValueError when the new key already has entries: those
-        belong to another identity, and merging would hand its grants over.
+        entries. Raises ValueError when the new key already has entries of
+        another identity: merging would hand its grants over. Entries there
+        under this identity's own label are a copy left by an earlier attempt
+        whose cleanup failed; they are replaced, so the change can be retried.
         """
         old_key = old_identity_pubkey.lower()
         new_key = new_identity_pubkey.lower()
         with self._connect() as conn:
-            occupied = conn.execute(
-                "SELECT 1 FROM acl_entries WHERE identity_pubkey = ? LIMIT 1", (new_key,)
+            foreign = conn.execute(
+                "SELECT 1 FROM acl_entries WHERE identity_pubkey = ? AND identity_label != ? "
+                "LIMIT 1",
+                (new_key, identity_label),
             ).fetchone()
-            if occupied:
-                raise ValueError(f"key {new_key[:8]}... already has ACL entries")
+            if foreign:
+                raise ValueError(f"key {new_key[:8]}... already has another identity's ACL entries")
+            conn.execute("DELETE FROM acl_entries WHERE identity_pubkey = ?", (new_key,))
             return conn.execute(
                 """
                 INSERT INTO acl_entries (identity_pubkey, identity_label, client_pubkey,

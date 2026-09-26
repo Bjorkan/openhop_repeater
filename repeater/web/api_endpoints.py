@@ -6857,6 +6857,8 @@ class APIEndpoints:
                 else:
                     commit()
             except _SaveFailed:
+                # save_to_file reports failure by returning False, never by
+                # raising, so anything else below is the ACL move's.
                 return refuse("Failed to save configuration to file")
             except Exception as e:
                 logger.error(f"Failed to move the ACL of '{name_s}': {e}")
@@ -6899,12 +6901,28 @@ class APIEndpoints:
 
                     # Use the consolidated registration method
                     if hasattr(self.daemon_instance, "_register_identity_everywhere"):
+                        # The identity manager refuses a name or hash already
+                        # taken, which the running room's own entry always is,
+                        # so a rename or a rekey could never apply live and the
+                        # ACL name index lagged the config. Drop the old entry
+                        # first; put it back if the new one is refused.
+                        identity_manager = getattr(self.daemon_instance, "identity_manager", None)
+                        previous = (
+                            identity_manager.unregister_identity(old_name)
+                            if identity_manager is not None
+                            and hasattr(identity_manager, "unregister_identity")
+                            else None
+                        )
                         registration_success = self.daemon_instance._register_identity_everywhere(
                             name=final_name,
                             identity=room_identity,
                             config=identity,
                             identity_type="room_server",
                         )
+                        if not registration_success and previous is not None:
+                            identity_manager.register_identity(
+                                old_name, previous[0], previous[1], previous[2]
+                            )
                         if registration_success:
                             logger.info(
                                 f"Hot reload: Re-registered identity '{final_name}' with all systems"
@@ -7029,26 +7047,16 @@ class APIEndpoints:
 
             logger.info(f"Deleted identity: {name_s}")
 
-            # Drop its stored ACL. Room servers are not adopted by label, so a
-            # later room with the same name cannot inherit it either way; a
-            # failure here only leaves rows no identity will load.
-            repeater_handler = (
-                getattr(self.daemon_instance, "repeater_handler", None)
-                if self.daemon_instance
-                else None
-            )
-            storage = getattr(repeater_handler, "storage", None)
-            sqlite_handler = getattr(storage, "sqlite_handler", None)
+            # Drop its stored ACL, and stop its live ACL (whose handlers stay
+            # until a restart) writing it back. Room servers are not adopted by
+            # label, so a later room with this name does not inherit it.
             login_helper = getattr(self.daemon_instance, "login_helper", None)
-            for entry in removed:
+            for entry in removed if login_helper is not None else ():
                 pubkey = derive_companion_public_key_hex(entry.get("identity_key"))
                 if not pubkey:
                     continue
                 try:
-                    if login_helper is not None:
-                        login_helper.forget_identity_acl(name_s, pubkey)
-                    elif sqlite_handler is not None:
-                        sqlite_handler.delete_acl_identity(pubkey)
+                    login_helper.forget_identity_acl(name_s, pubkey)
                 except Exception as e:
                     logger.warning(f"Could not drop the stored ACL of '{name_s}': {e}")
 

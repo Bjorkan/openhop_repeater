@@ -151,18 +151,27 @@ class LoginHelper:
                 persist_filter=(lambda c: c.is_admin()) if identity_type == "room_server" else None,
                 adopt_by_label=identity_type == "repeater",
             )
-            identity_acl.load()
             # One ACL per identity: the one this replaces (the same name, or
             # the same stored rows after a key change) stops being listed and
             # stops writing, though its old handlers live until a restart.
+            # Detached before the load, so nothing it writes is missed.
             for superseded in {
                 self.acls_by_name.get(name),
                 self._live_acl_for_store_key(identity_acl.store_key or ""),
             }:
-                if superseded is not None and superseded is not identity_acl:
+                if superseded is not None:
                     superseded.detach_store()
                     self._drop_acl(superseded)
+            identity_acl.load()
 
+        displaced = self.acls.get(hash_byte)
+        if displaced is not None and displaced is not identity_acl and not displaced.detached:
+            # Handlers are keyed by the hash byte, so the text and request
+            # helpers can reach only one of two identities sharing it.
+            logger.warning(
+                f"'{name}' shares hash 0x{hash_byte:02X} with another identity; "
+                f"messages and requests to that hash reach '{name}' only"
+            )
         self.acls[hash_byte] = identity_acl
         self.acls_by_name[name] = identity_acl
         if identity_type != "room_server":
@@ -418,9 +427,17 @@ class LoginHelper:
 
         label = acl_identity_label(new_name, "room_server")
         live = self.acls_by_name.get(old_name)
-        if live is not None and live.store_key == old_pubkey_hex.lower():
+        if live is None or live.store_key != old_pubkey_hex.lower():
+            # The name index can lag the config (a hot reload refused), but
+            # the store key names the rows, and one ACL at most holds it.
+            live = self._live_acl_for_store_key(old_pubkey_hex)
+        if live is not None:
             live.move_store(new_pubkey_hex, label, commit)
             return
+        if self.sqlite_handler is None and old_pubkey_hex.lower() != new_pubkey_hex.lower():
+            # A key change with nowhere to move the entries would save a key
+            # whose access list is gone.
+            raise RuntimeError("no ACL store is available to move the room's access list")
         move_identity_acl(self.sqlite_handler, old_pubkey_hex, new_pubkey_hex, label, commit)
 
     def forget_identity_acl(self, name: str, pubkey_hex: str) -> int:

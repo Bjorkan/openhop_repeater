@@ -416,3 +416,97 @@ def test_remove_from_every_acl_reports_which_failed(db, request_ctx):
     assert result["success"] is False
     assert "room-a (disk full)" in result["error"]
     assert "removed from repeater" in result["error"]
+
+
+class _LiveDaemon:
+    """A daemon whose hot reload goes through the real IdentityManager, as main.py's does."""
+
+    def __init__(self, db, room_name, room_seed):
+        from repeater.identity_manager import IdentityManager
+
+        self.identity_manager = IdentityManager({})
+        self.local_identity = LocalIdentity()
+        self.login_helper = LoginHelper(
+            identity_manager=self.identity_manager, packet_injector=AsyncMock(), sqlite_handler=db
+        )
+        self.repeater_handler = SimpleNamespace(storage=SimpleNamespace(sqlite_handler=db))
+        self.login_helper.register_identity(
+            "repeater", self.local_identity, identity_type="repeater", config={"repeater": {}}
+        )
+        cfg = {"name": room_name, "identity_key": room_seed, "settings": dict(ROOM_SETTINGS)}
+        self._register_identity_everywhere(
+            room_name, LocalIdentity(seed=bytes.fromhex(room_seed)), cfg, "room_server"
+        )
+        self.config = {"identities": {"room_servers": [cfg]}}
+
+    def _register_identity_everywhere(self, name, identity, config, identity_type):
+        if not self.identity_manager.register_identity(
+            name=name, identity=identity, config=config, identity_type=identity_type
+        ):
+            return False
+        self.login_helper.register_identity(
+            name=name, identity=identity, identity_type=identity_type, config=config
+        )
+        return True
+
+
+def test_a_rename_applies_live_and_the_room_stays_manageable(db, request_ctx):
+    daemon = _LiveDaemon(db, "room-a", "11" * 32)
+    api = _api(daemon, daemon.config)
+    acl = daemon.login_helper.get_acl_by_name("room-a")
+    acl.apply_permissions(LocalIdentity().get_public_key(), 3)
+
+    request_ctx.method = "PUT"
+    request_ctx.json = {"name": "room-a", "new_name": "room-b"}
+    result = api.update_identity()
+    assert "applied immediately" in result["message"]
+
+    assert daemon.login_helper.get_acl_by_name("room-b") is acl
+    assert daemon.login_helper.get_acl_by_name("room-a") is None
+    added = _post(
+        request_ctx,
+        api.acl_set_permissions,
+        {
+            "identity_name": "room-b",
+            "client_pubkey": LocalIdentity().get_public_key().hex(),
+            "permissions": 3,
+        },
+    )
+    assert added["success"] is True
+
+
+def test_a_rename_then_a_rekey_leaves_one_live_acl(db, request_ctx):
+    daemon = _LiveDaemon(db, "room-a", "11" * 32)
+    api = _api(daemon, daemon.config)
+    daemon.login_helper.get_acl_by_name("room-a").apply_permissions(
+        LocalIdentity().get_public_key(), 3
+    )
+
+    request_ctx.method = "PUT"
+    request_ctx.json = {"name": "room-a", "new_name": "room-b"}
+    api.update_identity()
+    request_ctx.method = "PUT"
+    request_ctx.json = {"name": "room-b", "identity_key": "22" * 32}
+    assert "applied immediately" in api.update_identity()["message"]
+
+    attached = [a for a in set(daemon.login_helper.acls_by_name.values()) if not a.detached]
+    assert len(attached) == 2  # the repeater and the room
+    assert [n for n, *_ in daemon.identity_manager.get_identities_by_type("room_server")] == [
+        "room-b"
+    ]
+    new_pubkey = LocalIdentity(seed=bytes.fromhex("22" * 32)).get_public_key().hex()
+    assert daemon.login_helper.get_acl_by_name("room-b").store_key == new_pubkey
+    assert len(db.load_acl_entries(new_pubkey)) == 1
+
+
+def test_a_refused_hot_reload_keeps_the_room_registered(db, request_ctx):
+    daemon = _LiveDaemon(db, "room-a", "11" * 32)
+    api = _api(daemon, daemon.config)
+    daemon._register_identity_everywhere = MagicMock(return_value=False)
+
+    request_ctx.method = "PUT"
+    request_ctx.json = {"name": "room-a", "new_name": "room-b"}
+    assert "Restart required" in api.update_identity()["message"]
+    assert [n for n, *_ in daemon.identity_manager.get_identities_by_type("room_server")] == [
+        "room-a"
+    ]

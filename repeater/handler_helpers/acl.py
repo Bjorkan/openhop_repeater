@@ -67,8 +67,9 @@ def move_identity_acl(store, old_key: str, new_key: str, identity_label: str, co
     that names the new key), then deletes the old entries. Every failure
     leaves the key the config names holding its entries: if the copy or the
     commit fails, the old entries are untouched (copies are dropped); if only
-    the final delete fails, the old key keeps a stale copy that no identity
-    loads. Raises what the copy or the commit raised.
+    the final delete fails, the old key keeps a stale copy. A stale copy is
+    replaced when the same change is retried; an identity later created on
+    that key would load it. Raises what the copy or the commit raised.
 
     For a rename (same key) this commits and then relabels the entries.
     """
@@ -93,16 +94,16 @@ def move_identity_acl(store, old_key: str, new_key: str, identity_label: str, co
                 store.delete_acl_identity(new_key)
             except Exception as e:
                 logger.warning(
-                    f"Could not drop the ACL copied to {new_key[:8]}...: {e}; "
-                    f"no identity uses that key, so it is not loaded"
+                    f"Could not drop the ACL copied to {new_key[:8]}...: {e}. Retrying "
+                    f"the change replaces it; a new identity on that key would load it"
                 )
             raise
     try:
         store.delete_acl_identity(old_key)
     except Exception as e:
         logger.warning(
-            f"Could not drop the ACL left under the old key {old_key[:8]}...: {e}; "
-            f"no identity uses that key, so it is not loaded"
+            f"Could not drop the ACL left under the old key {old_key[:8]}...: {e}. "
+            f"A new identity on that key would load it"
         )
 
 
