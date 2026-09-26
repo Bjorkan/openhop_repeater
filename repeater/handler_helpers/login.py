@@ -126,7 +126,7 @@ class LoginHelper:
             identity_acl.admin_password = final_security["admin_password"] or ""
             identity_acl.guest_password = final_security["guest_password"] or ""
             identity_acl.allow_read_only = final_security["allow_read_only"]
-            identity_acl.retarget_store(identity_acl.store_key, label)
+            identity_acl.set_label(label)
             for stale_name, stale_acl in list(self.acls_by_name.items()):
                 if stale_acl is identity_acl and stale_name != name:
                     del self.acls_by_name[stale_name]
@@ -387,16 +387,28 @@ class LoginHelper:
         rows too, so changes made before the restart that applies the new key
         are not written under the old one.
         """
-        if self.sqlite_handler is None:
-            return 0
         from repeater.handler_helpers.acl import acl_identity_label
 
         label = acl_identity_label(new_name, "room_server")
-        moved = self.sqlite_handler.move_acl_identity(old_pubkey_hex, new_pubkey_hex, label)
-        for acl in set(self.acls.values()):
-            if acl.store_key == old_pubkey_hex.lower():
-                acl.retarget_store(new_pubkey_hex, label)
-        return moved
+        live = self._live_acl_for_store_key(old_pubkey_hex)
+        if live is not None:
+            return live.move_store(new_pubkey_hex, label)
+        if self.sqlite_handler is None:
+            return 0
+        return self.sqlite_handler.move_acl_identity(old_pubkey_hex, new_pubkey_hex, label)
+
+    def forget_identity_acl(self, pubkey_hex: str) -> int:
+        """Drop a deleted identity's stored ACL, and stop its live ACL writing it back."""
+        live = self._live_acl_for_store_key(pubkey_hex)
+        if live is not None:
+            live.detach_store()
+        if self.sqlite_handler is None:
+            return 0
+        return self.sqlite_handler.delete_acl_identity(pubkey_hex)
+
+    def _live_acl_for_store_key(self, pubkey_hex: str):
+        key = pubkey_hex.lower()
+        return next((acl for acl in self.acls.values() if acl.store_key == key), None)
 
     def list_authenticated_clients(self, hash_byte: int = None):
         """List authenticated clients for a specific identity or all identities."""

@@ -4908,17 +4908,18 @@ class SQLiteHandler:
     ) -> int:
         """Move an identity's entries to its new public key and label, in one transaction.
 
-        An entry the new key already has wins over the moved one.
+        Raises ValueError when the new key already has entries: those belong to
+        another identity, and merging would hand its grants over.
         """
         old_key = old_identity_pubkey.lower()
         new_key = new_identity_pubkey.lower()
         with self._connect() as conn:
             if old_key != new_key:
-                conn.execute(
-                    "DELETE FROM acl_entries WHERE identity_pubkey = ? AND client_pubkey IN "
-                    "(SELECT client_pubkey FROM acl_entries WHERE identity_pubkey = ?)",
-                    (old_key, new_key),
-                )
+                occupied = conn.execute(
+                    "SELECT 1 FROM acl_entries WHERE identity_pubkey = ? LIMIT 1", (new_key,)
+                ).fetchone()
+                if occupied:
+                    raise ValueError(f"key {new_key[:8]}... already has ACL entries")
             return conn.execute(
                 "UPDATE acl_entries SET identity_pubkey = ?, identity_label = ? "
                 "WHERE identity_pubkey = ?",

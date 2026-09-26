@@ -128,7 +128,7 @@ class ACL:
         self._persist_filter = persist_filter
         self._adopt_by_label = adopt_by_label
         # Rows are stored under this key: the identity's public key at
-        # construction, until retarget_store() moves them.
+        # construction, until move_store() moves them.
         self._store_key: Optional[str] = (
             bytes(local_identity.get_public_key()[:PUB_KEY_SIZE]).hex()
             if local_identity is not None
@@ -136,6 +136,9 @@ class ACL:
         )
         # Permissions as last written to the store, keyed like ``clients``.
         self._persisted: Dict[bytes, int] = {}
+        # Set when load() could not read the store: the table is then not the
+        # stored one, and the web API says so rather than showing it as empty.
+        self.load_error: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Persistence
@@ -175,8 +178,13 @@ class ACL:
                     adopt_label=self._identity_label if self._adopt_by_label else None,
                 )
             except Exception as e:
-                logger.error(f"Failed to load ACL for '{self._identity_label}': {e}")
+                self.load_error = str(e)
+                logger.error(
+                    f"Failed to load the stored ACL for '{self._identity_label}': {e}. "
+                    f"Stored entries cannot log in until it loads."
+                )
                 return 0
+            self.load_error = None
 
             loaded = 0
             for row in rows:
@@ -208,11 +216,36 @@ class ACL:
             )
         return loaded
 
-    def retarget_store(self, identity_pubkey_hex: str, identity_label: str) -> None:
-        """Point later writes at the rows ``move_acl_identity`` moved to a new key."""
+    def move_store(self, identity_pubkey_hex: str, identity_label: str) -> int:
+        """Move the stored entries to a new identity key and label, and write there after.
+
+        Holds the lock across the move, so a change cannot be written under the
+        old key after its rows have gone. Raises when the store refuses; the
+        ACL then still writes where it did.
+        """
+        new_key = identity_pubkey_hex.lower()
         with self._lock:
-            self._store_key = identity_pubkey_hex.lower()
+            moved = 0
+            if self._persistence_enabled():
+                moved = self._store.move_acl_identity(self._store_key, new_key, identity_label)
+            self._store_key = new_key
             self._identity_label = identity_label
+            return moved
+
+    def set_label(self, identity_label: str) -> None:
+        """The label written with later changes, as after a rename."""
+        with self._lock:
+            self._identity_label = identity_label
+
+    def detach_store(self) -> None:
+        """Stop writing to the store: the identity was deleted.
+
+        Its handlers stay registered until a restart, and a login there must
+        not write back the entries the delete removed.
+        """
+        with self._lock:
+            self._store = None
+            self._persisted.clear()
 
     @property
     def store_key(self) -> Optional[str]:
