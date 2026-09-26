@@ -314,7 +314,7 @@ def test_misc_commands_and_routes():
 
     storage = SimpleNamespace(
         delete_neighbors_by_pubkey_prefix=MagicMock(return_value=1),
-        get_neighbors=lambda: {"aa" * 32: {"is_repeater": True, "zero_hop": True}},
+        get_neighbors=lambda **_: {"aa" * 32: {"is_repeater": True, "zero_hop": True}},
     )
     cli.storage_handler = storage
     assert cli._cmd_neighbor_remove("neighbor.remove abcd") == "OK"
@@ -714,7 +714,7 @@ def _neighbor_cli(neighbors=None):
     cli = MeshCLI("/tmp/cfg.yaml", _base_config(), _cfg_mgr())
     storage = SimpleNamespace(
         delete_neighbors_by_pubkey_prefix=MagicMock(return_value=1),
-        get_neighbors=lambda: neighbors or {},
+        get_neighbors=lambda **_: neighbors or {},
     )
     cli.storage_handler = storage
     return cli, storage.delete_neighbors_by_pubkey_prefix
@@ -808,3 +808,18 @@ def test_neighbor_remove_rejects_a_malformed_key(key):
 def test_neighbor_remove_help_lists_remove_all():
     cli, _ = _neighbor_cli()
     assert "neighbor.remove all" in cli.handle_command(b"\x00" * 32, "help", True)
+
+
+def test_neighbor_remove_all_reports_a_failed_read_instead_of_ok(tmp_path):
+    """get_neighbors answers {} on a storage error by default; clearing must not
+    report OK when it could not even read what to clear."""
+    from repeater.data_acquisition.sqlite_handler import SQLiteHandler
+
+    handler = SQLiteHandler(tmp_path)
+    cli = MeshCLI("/tmp/cfg.yaml", _base_config(), _cfg_mgr())
+    cli.storage_handler = handler
+
+    with patch.object(handler, "_connect", side_effect=RuntimeError("database is locked")):
+        reply = cli.handle_command(b"\x00" * 32, "neighbor.remove all", True)
+
+    assert reply == "Error: database is locked"
