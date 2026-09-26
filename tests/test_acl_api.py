@@ -439,7 +439,9 @@ class _LiveDaemon:
         )
         self.config = {"identities": {"room_servers": [cfg]}}
 
-    def _register_identity_everywhere(self, name, identity, config, identity_type):
+    def _register_identity_everywhere(
+        self, name, identity, config, identity_type, previous_name=None
+    ):
         if not self.identity_manager.register_identity(
             name=name, identity=identity, config=config, identity_type=identity_type
         ):
@@ -510,3 +512,45 @@ def test_a_refused_hot_reload_keeps_the_room_registered(db, request_ctx):
     assert [n for n, *_ in daemon.identity_manager.get_identities_by_type("room_server")] == [
         "room-a"
     ]
+
+
+def test_a_hot_reload_that_raises_keeps_the_room_registered(db, request_ctx):
+    daemon = _LiveDaemon(db, "room-a", "11" * 32)
+    api = _api(daemon, daemon.config)
+    daemon._register_identity_everywhere = MagicMock(side_effect=RuntimeError("boom"))
+
+    request_ctx.method = "PUT"
+    request_ctx.json = {"name": "room-a", "new_name": "room-b"}
+    assert "Restart required" in api.update_identity()["message"]
+    assert [n for n, *_ in daemon.identity_manager.get_identities_by_type("room_server")] == [
+        "room-a"
+    ]
+
+
+def test_a_rename_that_clears_the_passwords_waits_for_a_restart(db, request_ctx):
+    daemon = _LiveDaemon(db, "room-a", "11" * 32)
+    api = _api(daemon, daemon.config)
+
+    request_ctx.method = "PUT"
+    request_ctx.json = {
+        "name": "room-a",
+        "new_name": "room-b",
+        "settings": {"admin_password": "", "guest_password": ""},
+    }
+    assert "Restart required" in api.update_identity()["message"]
+    # Nothing half-applied: the running room keeps its registration and ACL.
+    assert [n for n, *_ in daemon.identity_manager.get_identities_by_type("room_server")] == [
+        "room-a"
+    ]
+    assert daemon.login_helper.get_acl_by_name("room-a") is not None
+
+
+def test_delete_identity_frees_the_name_and_hash(db, request_ctx):
+    daemon = _LiveDaemon(db, "room-a", "11" * 32)
+    api = _api(daemon, daemon.config)
+
+    request_ctx.method = "DELETE"
+    assert api.delete_identity(name="room-a", type="room_server")["success"] is True
+    identity = LocalIdentity(seed=bytes.fromhex("11" * 32))
+    # Re-creating the room registers at once instead of conflicting until a restart.
+    assert daemon.identity_manager.registration_error("room-a", identity, "room_server") is None

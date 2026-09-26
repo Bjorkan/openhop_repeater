@@ -159,7 +159,7 @@ class LoginHelper:
                 self.acls_by_name.get(name),
                 self._live_acl_for_store_key(identity_acl.store_key or ""),
             }:
-                if superseded is not None:
+                if superseded is not None and superseded is not identity_acl:
                     superseded.detach_store()
                     self._drop_acl(superseded)
             identity_acl.load()
@@ -426,6 +426,10 @@ class LoginHelper:
         from repeater.handler_helpers.acl import acl_identity_label, move_identity_acl
 
         label = acl_identity_label(new_name, "room_server")
+        if self.sqlite_handler is None and old_pubkey_hex.lower() != new_pubkey_hex.lower():
+            # A key change with nowhere to move the entries would save a key
+            # whose access list is gone.
+            raise RuntimeError("no ACL store is available to move the room's access list")
         live = self.acls_by_name.get(old_name)
         if live is None or live.store_key != old_pubkey_hex.lower():
             # The name index can lag the config (a hot reload refused), but
@@ -434,10 +438,6 @@ class LoginHelper:
         if live is not None:
             live.move_store(new_pubkey_hex, label, commit)
             return
-        if self.sqlite_handler is None and old_pubkey_hex.lower() != new_pubkey_hex.lower():
-            # A key change with nowhere to move the entries would save a key
-            # whose access list is gone.
-            raise RuntimeError("no ACL store is available to move the room's access list")
         move_identity_acl(self.sqlite_handler, old_pubkey_hex, new_pubkey_hex, label, commit)
 
     def forget_identity_acl(self, name: str, pubkey_hex: str) -> int:
