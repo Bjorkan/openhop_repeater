@@ -16,6 +16,8 @@ from typing import Any, Callable, Optional
 
 from openhop_core.companion import CompanionBridge
 
+from repeater import __version__ as repeater_version
+
 logger = logging.getLogger("RepeaterCompanionBridge")
 
 
@@ -93,6 +95,11 @@ class RepeaterCompanionBridge(CompanionBridge):
             radio_settings_getter=radio_settings_getter,
             max_tx_power_getter=max_tx_power_getter,
         )
+        # The companion CLI's `ver` names the openHop software; add the repeater
+        # ahead of the core. An older core has no companion CLI to tell.
+        add_version = getattr(getattr(self, "cli", None), "add_software_version", None)
+        if callable(add_version):
+            add_version("repeater", repeater_version)
 
     def _save_prefs(self) -> None:
         """Persist full NodePrefs as JSON to SQLite."""

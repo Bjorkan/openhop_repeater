@@ -885,3 +885,17 @@ def test_neighbor_remove_takes_the_cached_scopes_with_it(tmp_path):
 
     assert cli.handle_command(b"\x00" * 32, "neighbor.remove all", True) == "OK"
     assert set(handler.get_neighbor_scopes()) == {companion}
+@pytest.mark.parametrize(
+    ("identity_type", "role"), [("repeater", "repeater"), ("room_server", "room_server")]
+)
+def test_ver_reports_the_installed_repeater_and_core_versions(identity_type, role):
+    """Nothing sets config["version"], so it must not be the source: it answered
+    the stale fallback "v13" on every real node."""
+    import openhop_core
+
+    import repeater
+
+    cli = MeshCLI("/tmp/cfg.yaml", _base_config(), _cfg_mgr(), identity_type=identity_type)
+    assert cli.handle_command(b"\x00" * 32, "ver", True) == (
+        f"openHop_{role} v{repeater.__version__} (core v{openhop_core.__version__})"
+    )
