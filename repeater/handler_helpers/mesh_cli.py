@@ -1,5 +1,6 @@
 import concurrent.futures
 import logging
+import re
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -17,6 +18,7 @@ class MeshCLI:
         send_advert_callback: Optional[Callable] = None,
         identity=None,
         storage_handler=None,
+        acl=None,
     ):
 
         self.config_path = Path(config_path)
@@ -27,6 +29,8 @@ class MeshCLI:
         self.send_advert_callback = send_advert_callback
         self.identity = identity
         self.storage_handler = storage_handler
+        # This identity's ACL, for setperm and get acl.
+        self.acl = acl
 
         # Store event loop reference for thread-safe scheduling
         import asyncio
@@ -137,7 +141,15 @@ class MeshCLI:
 
         return enriched
 
-    def handle_command(self, sender_pubkey: bytes, command: str, is_admin: bool) -> str:
+    def handle_command(
+        self, sender_pubkey: bytes, command: str, is_admin: bool, local: bool = False
+    ) -> str:
+        """Run one CLI command and return the reply.
+
+        ``local`` marks the operator's own console (the web CLI), our stand-in
+        for firmware's serial port, where ``sender_timestamp`` is 0. Commands
+        firmware accepts only on serial, such as ``get acl``, need it.
+        """
 
         # Check admin permission first
         if not is_admin:
@@ -157,14 +169,14 @@ class MeshCLI:
         logger.debug(f"After strip: '{command}'")
 
         # Route to appropriate handler
-        reply = self._route_command(command)
+        reply = self._route_command(command, local=local)
 
         # Add prefix back to reply if present
         if prefix:
             return prefix + reply
         return reply
 
-    def _route_command(self, command: str) -> str:
+    def _route_command(self, command: str, local: bool = False) -> str:
 
         # Help
         if command == "help" or command.startswith("help "):
@@ -192,6 +204,15 @@ class MeshCLI:
         elif command == "ver":
             return self._cmd_version()
 
+        # ACL commands. Firmware handles these before the common CLI, and
+        # "get acl" must be matched before the generic "get " below.
+        elif command.startswith("setperm "):
+            return self._cmd_setperm(command)
+        elif command == "get acl":
+            if not local:
+                return "Error: Use 'get acl' via serial console only"
+            return self._cmd_get_acl()
+
         # Get commands
         elif command.startswith("get "):
             return self._cmd_get(command[4:])
@@ -199,12 +220,6 @@ class MeshCLI:
         # Set commands
         elif command.startswith("set "):
             return self._cmd_set(command[4:])
-
-        # ACL commands
-        elif command.startswith("setperm "):
-            return self._cmd_setperm(command)
-        elif command == "get acl":
-            return "Error: Use 'get acl' via serial console only"
 
         # Region commands (repeaters only)
         elif command.startswith("region"):
@@ -360,7 +375,12 @@ class MeshCLI:
                 "  region scopes, then publish the table to the MQTT neighbors topic.\n"
                 "  Requires a broker configured with neighbors: true."
             ),
-            "setperm": "setperm <pubkey_hex> <permission_int> \u2014 Set ACL permissions for a node.",
+            "setperm": (
+                "setperm <pubkey_hex> <perm> \u2014 Set a node's ACL entry, kept across restarts.\n"
+                "  perm: 1 read-only, 2 read-write, 3 admin (full 64-hex key)\n"
+                "  perm 0 removes the entry (a key prefix is enough)\n"
+                "  A key with an entry logs in with a blank password."
+            ),
             "log": "log start|stop|erase \u2014 Control logging.",
         }
         return details.get(topic, f"No detailed help for '{topic}'. Type 'help' for command list.")
@@ -809,22 +829,48 @@ class MeshCLI:
 
     # ==================== ACL Commands ====================
 
+    @staticmethod
+    def _atoi(text: str) -> int:
+        """C ``atoi``: leading whitespace, optional sign, digits; anything else is 0."""
+        match = re.match(r"\s*([+-]?\d+)", text)
+        return int(match.group(1)) if match else 0
+
     def _cmd_setperm(self, command: str) -> str:
-        """Set permissions for a public key."""
-        # Format: setperm {pubkey-hex} {permissions-int}
-        parts = command[8:].split()
-        if len(parts) < 2:
+        """``setperm {pubkey-hex} {permissions}``, as firmware's repeater and room server.
+
+        The permissions go through ``atoi`` into a byte, so a non-numeric value
+        is 0, the guest role, which deletes the entry. A guest role takes a key
+        prefix; any other role needs the full 64-hex key.
+        """
+        args = command[len("setperm ") :]
+        sep = args.find(" ")
+        if sep < 0:
             return "Err - bad params"
-
-        pubkey_hex = parts[0]
+        pubkey_hex = args[:sep]
+        # Firmware reads at most a full key's worth of hex, and the whole
+        # string must then be that length and even.
+        hex_len = min(len(pubkey_hex), 64)
+        if len(pubkey_hex) != (hex_len // 2) * 2:
+            return "Err - bad pubkey"
         try:
-            permissions = int(parts[1])
+            pubkey = bytes.fromhex(pubkey_hex)
         except ValueError:
-            return "Err - invalid permissions"
+            return "Err - bad pubkey"
+        permissions = self._atoi(args[sep + 1 :]) & 0xFF
 
-        # TODO: Apply permissions via ACL
-        logger.info(f"setperm command: {pubkey_hex} -> {permissions}")
-        return "Error: Not yet implemented - use config file"
+        if self.acl is None:
+            logger.error("setperm: no ACL is attached to this CLI")
+            return "Err - invalid params"
+        if not self.acl.apply_permissions(pubkey, permissions):
+            return "Err - invalid params"
+        return "OK"
+
+    def _cmd_get_acl(self) -> str:
+        """``get acl``: the header, then ``"%02X <pubkey>"`` for each entry with permissions."""
+        lines = ["ACL:"]
+        if self.acl is not None:
+            lines.extend(self.acl.format_acl_lines())
+        return "\n".join(lines)
 
     # ==================== Region Commands ====================
 

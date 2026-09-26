@@ -260,6 +260,7 @@ class TextHelper:
                     send_advert_callback=self.send_advert_callback,
                     identity=identity,
                     storage_handler=self.sqlite_handler,
+                    acl=identity_acl,
                 )
                 logger.info(
                     "Initialized CLI handler for repeater commands with identity and storage"

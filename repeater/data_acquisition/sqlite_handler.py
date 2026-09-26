@@ -1009,6 +1009,29 @@ class SQLiteHandler:
                     "CREATE INDEX IF NOT EXISTS idx_room_client_sync_pending ON room_client_sync(pending_ack_crc)"
                 )
 
+                # Persistent ACL entries, firmware's /s_contacts. Rows are keyed
+                # by the local identity's full public key rather than its 1-byte
+                # hash, which collides between identities. identity_label
+                # ("repeater", "room_server:<name>") lets a restarted identity
+                # adopt its rows after a key change, as firmware's ACL survives
+                # a new private key. Shared secrets are derived on load, not
+                # stored, so a key change cannot leave stale ones on disk.
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS acl_entries (
+                        identity_pubkey TEXT NOT NULL,
+                        identity_label TEXT NOT NULL,
+                        client_pubkey TEXT NOT NULL,
+                        permissions INTEGER NOT NULL,
+                        updated_at REAL NOT NULL,
+                        PRIMARY KEY (identity_pubkey, client_pubkey)
+                    )
+                """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_acl_entries_label ON acl_entries(identity_label)"
+                )
+
                 conn.commit()
                 logger.info(f"SQLite database initialized: {self.sqlite_path}")
 
@@ -4803,6 +4826,111 @@ class SQLiteHandler:
                 return cursor.rowcount
         except Exception as e:
             logger.error(f"Failed to cleanup old messages: {e}")
+            return 0
+
+    # ACL persistence methods
+    def load_acl_entries(self, identity_pubkey: str, identity_label: str) -> List[Dict]:
+        """Return the stored ACL entries for one local identity.
+
+        Rows are matched on ``identity_pubkey``. When there are none, rows stored
+        under the same ``identity_label`` but a different public key are adopted:
+        that identity was given a new key, and its admins should keep access.
+        Matched rows take the current label, so a renamed identity is still
+        found by label after a later key change.
+
+        Raises on a database error: the caller decides whether an empty ACL is
+        safe, and an error must not look like "no entries".
+        """
+        identity_pubkey = identity_pubkey.lower()
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT client_pubkey, permissions FROM acl_entries WHERE identity_pubkey = ?",
+                (identity_pubkey,),
+            ).fetchall()
+            if rows:
+                conn.execute(
+                    "UPDATE acl_entries SET identity_label = ? "
+                    "WHERE identity_pubkey = ? AND identity_label != ?",
+                    (identity_label, identity_pubkey, identity_label),
+                )
+            else:
+                previous = conn.execute(
+                    "SELECT identity_pubkey FROM acl_entries WHERE identity_label = ? "
+                    "ORDER BY updated_at DESC LIMIT 1",
+                    (identity_label,),
+                ).fetchone()
+                if previous:
+                    conn.execute(
+                        "UPDATE acl_entries SET identity_pubkey = ? WHERE identity_pubkey = ?",
+                        (identity_pubkey, previous["identity_pubkey"]),
+                    )
+                    logger.info(
+                        f"ACL for '{identity_label}' moved from key "
+                        f"{previous['identity_pubkey'][:8]}... to {identity_pubkey[:8]}..."
+                    )
+                    rows = conn.execute(
+                        "SELECT client_pubkey, permissions FROM acl_entries "
+                        "WHERE identity_pubkey = ?",
+                        (identity_pubkey,),
+                    ).fetchall()
+            return [dict(row) for row in rows]
+
+    def upsert_acl_entry(
+        self, identity_pubkey: str, identity_label: str, client_pubkey: str, permissions: int
+    ) -> bool:
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO acl_entries (identity_pubkey, identity_label, client_pubkey,
+                                             permissions, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(identity_pubkey, client_pubkey) DO UPDATE SET
+                        identity_label = excluded.identity_label,
+                        permissions = excluded.permissions,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        identity_pubkey.lower(),
+                        identity_label,
+                        client_pubkey.lower(),
+                        int(permissions),
+                        time.time(),
+                    ),
+                )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save ACL entry: {e}")
+            return False
+
+    def delete_acl_entry(self, identity_pubkey: str, client_pubkey: str) -> bool:
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "DELETE FROM acl_entries WHERE identity_pubkey = ? AND client_pubkey = ?",
+                    (identity_pubkey.lower(), client_pubkey.lower()),
+                )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete ACL entry: {e}")
+            return False
+
+    def delete_acl_identity(self, identity_pubkey: Optional[str], identity_label: str) -> int:
+        """Drop every ACL entry of a deleted identity, by key and by label.
+
+        The label match stops a new identity created under the same name from
+        adopting the deleted one's admins.
+        """
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    "DELETE FROM acl_entries WHERE identity_pubkey = ? OR identity_label = ?",
+                    ((identity_pubkey or "").lower(), identity_label),
+                )
+                return cursor.rowcount
+        except Exception as e:
+            logger.error(f"Failed to delete ACL entries for '{identity_label}': {e}")
             return 0
 
     # Companion persistence methods

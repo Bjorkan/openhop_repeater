@@ -293,9 +293,9 @@ def test_misc_commands_and_routes():
     assert cli._cmd_region("region remove x") == "Err - not found"
     assert cli._cmd_region("region unknown").startswith("Err -")
 
+    # Full setperm coverage lives in test_acl_persistence.py.
     assert cli._cmd_setperm("setperm") == "Err - bad params"
-    assert cli._cmd_setperm("setperm abc zz") == "Err - invalid permissions"
-    assert cli._cmd_setperm("setperm abc 2").startswith("Error:")
+    assert cli._cmd_setperm("setperm abc zz") == "Err - bad pubkey"
 
     assert cli._cmd_tempradio("tempradio 1 2 3").startswith("Error: Expected")
     assert cli._cmd_tempradio("tempradio 299 125 7 5 10") == "Error: invalid frequency"

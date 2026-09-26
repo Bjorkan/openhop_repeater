@@ -6967,10 +6967,10 @@ class APIEndpoints:
             room_servers = identities_config.get("room_servers") or []
 
             # Find and remove the identity
-            initial_count = len(room_servers)
+            removed = [r for r in room_servers if str(r.get("name") or "").strip() == name_s]
             room_servers = [r for r in room_servers if str(r.get("name") or "").strip() != name_s]
 
-            if len(room_servers) == initial_count:
+            if not removed:
                 return self._error(f"Identity '{name_s}' not found")
 
             # Update config
@@ -6981,6 +6981,24 @@ class APIEndpoints:
                 return self._error("Failed to save configuration to file")
 
             logger.info(f"Deleted identity: {name_s}")
+
+            # Drop its stored ACL, so a room created later under this name does
+            # not inherit the deleted room's admins.
+            repeater_handler = (
+                getattr(self.daemon_instance, "repeater_handler", None)
+                if self.daemon_instance
+                else None
+            )
+            storage = getattr(repeater_handler, "storage", None)
+            sqlite_handler = getattr(storage, "sqlite_handler", None)
+            if sqlite_handler is not None:
+                from repeater.handler_helpers.acl import acl_identity_label
+
+                for entry in removed:
+                    sqlite_handler.delete_acl_identity(
+                        derive_companion_public_key_hex(entry.get("identity_key")),
+                        acl_identity_label(name_s, "room_server"),
+                    )
 
             unregister_success = False
             if self.daemon_instance:
@@ -8272,6 +8290,7 @@ class APIEndpoints:
                 sender_pubkey=b"api-cli",
                 command=command,
                 is_admin=True,
+                local=True,
             )
             return self._success({"reply": reply})
         except cherrypy.HTTPError:
