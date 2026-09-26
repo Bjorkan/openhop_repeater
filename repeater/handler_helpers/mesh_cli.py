@@ -3,6 +3,10 @@ import logging
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+from openhop_core import __version__ as core_version
+
+from repeater import __version__ as repeater_version
+
 logger = logging.getLogger(__name__)
 
 
@@ -468,10 +472,13 @@ class MeshCLI:
         return "Error: Not yet implemented"
 
     def _cmd_version(self) -> str:
-        """Get version information."""
+        """Report the installed openHop repeater and core versions.
+
+        Nothing sets ``config["version"]``, so reading it answered the stale
+        fallback "v13" in every real deployment.
+        """
         role = "room_server" if self.identity_type == "room_server" else "repeater"
-        version = self.config.get("version", "13")
-        return f"openHop_{role} v{version}"
+        return f"openHop_{role} v{repeater_version} (core v{core_version})"
 
     # ==================== Get Commands ====================
 

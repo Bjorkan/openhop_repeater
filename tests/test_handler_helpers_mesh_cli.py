@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from repeater.handler_helpers.mesh_cli import MeshCLI
 
 
@@ -701,3 +703,19 @@ def test_cli_set_commands_persist_with_real_config_manager(tmp_path):
     assert saved["delays"]["rx_delay_base"] == 4.5
     assert saved["delays"]["tx_delay_factor"] == 1.5
     assert saved["delays"]["direct_tx_delay_factor"] == 0.25
+
+
+@pytest.mark.parametrize(
+    ("identity_type", "role"), [("repeater", "repeater"), ("room_server", "room_server")]
+)
+def test_ver_reports_the_installed_repeater_and_core_versions(identity_type, role):
+    """Nothing sets config["version"], so it must not be the source: it answered
+    the stale fallback "v13" on every real node."""
+    import openhop_core
+
+    import repeater
+
+    cli = MeshCLI("/tmp/cfg.yaml", _base_config(), _cfg_mgr(), identity_type=identity_type)
+    assert cli.handle_command(b"\x00" * 32, "ver", True) == (
+        f"openHop_{role} v{repeater.__version__} (core v{openhop_core.__version__})"
+    )

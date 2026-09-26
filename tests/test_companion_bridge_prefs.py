@@ -84,3 +84,23 @@ def test_bridge_accepts_host_radio_callbacks(identity):
         "airtime_factor": 1.0,
     }
     assert bridge.get_max_tx_power_dbm() == 20
+
+
+def test_companion_ver_names_the_repeater_and_core_versions():
+    """The virtual companion's CLI `ver` (CMD_RUN_CLI_COMMAND / remote CLI)
+    reports the openHop software running it, repeater first."""
+    import openhop_core
+    from openhop_core.protocol import LocalIdentity
+
+    import repeater
+    from repeater.companion.bridge import RepeaterCompanionBridge
+
+    async def _inject(pkt, wait_for_ack=False, expected_crc=None):
+        return True
+
+    bridge = RepeaterCompanionBridge(LocalIdentity(), _inject, node_name="Comp")
+    if not hasattr(bridge, "cli"):
+        pytest.skip("installed openhop_core predates the companion CLI")
+    assert bridge.cli.handle("ver") == (
+        f"openHop repeater v{repeater.__version__}, core v{openhop_core.__version__}"
+    )
