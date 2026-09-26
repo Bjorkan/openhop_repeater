@@ -1,4 +1,5 @@
 import logging
+import threading
 import time
 from typing import Callable, Dict, List, Optional
 
@@ -48,14 +49,15 @@ def role_name(permissions: int) -> str:
 
 
 def acl_identity_label(name: str, identity_type: str) -> str:
-    """Stable label for an identity's stored ACL, independent of its key.
+    """Label naming the owner of an identity's stored ACL.
 
     There is one repeater identity whatever it is named, so its label is
-    fixed. Room servers are told apart by their configured name.
+    fixed, and it is the only one adopted by label after a key change.
+    Other identities are told apart by their configured name.
     """
-    if identity_type == "room_server":
-        return f"room_server:{name}"
-    return "repeater"
+    if identity_type == "repeater":
+        return "repeater"
+    return f"{identity_type}:{name}"
 
 
 class ClientInfo:
@@ -83,6 +85,10 @@ class ClientInfo:
         return role_name(self.permissions)
 
 
+class ACLStoreError(RuntimeError):
+    """An ACL change could not be written to the store and was not applied."""
+
+
 class ACL:
     """Per-identity access control list, firmware ``ClientACL``.
 
@@ -91,6 +97,10 @@ class ACL:
     accepts. The repeater passes no filter; a room server keeps admins only,
     as firmware's ``saveFilter``. Writes happen when an entry's stored
     permissions change, not on every login, so a returning admin costs no I/O.
+
+    The table is changed from the event loop (logins) and from web request
+    threads (setperm, removal), so each change and its write happen under one
+    lock: otherwise a removal racing a grant could leave the grant stored.
     """
 
     def __init__(
@@ -103,6 +113,7 @@ class ACL:
         local_identity=None,
         identity_label: Optional[str] = None,
         persist_filter: Optional[Callable[["ClientInfo"], bool]] = None,
+        adopt_by_label: bool = False,
     ):
         self.max_clients = max_clients
         self.admin_password = admin_password or ""
@@ -110,10 +121,19 @@ class ACL:
         self.allow_read_only = allow_read_only
         self.clients: Dict[bytes, ClientInfo] = {}
 
+        self._lock = threading.RLock()
         self._store = store
         self._local_identity = local_identity
         self._identity_label = identity_label or ""
         self._persist_filter = persist_filter
+        self._adopt_by_label = adopt_by_label
+        # Rows are stored under this key: the identity's public key at
+        # construction, until retarget_store() moves them.
+        self._store_key: Optional[str] = (
+            bytes(local_identity.get_public_key()[:PUB_KEY_SIZE]).hex()
+            if local_identity is not None
+            else None
+        )
         # Permissions as last written to the store, keyed like ``clients``.
         self._persisted: Dict[bytes, int] = {}
 
@@ -121,13 +141,8 @@ class ACL:
     # Persistence
     # ------------------------------------------------------------------
 
-    def _identity_pubkey_hex(self) -> Optional[str]:
-        if self._local_identity is None:
-            return None
-        return bytes(self._local_identity.get_public_key()[:PUB_KEY_SIZE]).hex()
-
     def _persistence_enabled(self) -> bool:
-        return self._store is not None and self._identity_pubkey_hex() is not None
+        return self._store is not None and self._store_key is not None
 
     def _derive_secret(self, pub_key: bytes) -> bytes:
         """Shared secret with a client, recomputed rather than read from disk."""
@@ -140,42 +155,75 @@ class ACL:
             return b""
 
     def load(self) -> int:
-        """Fill the table from the store. Returns the number of entries loaded.
+        """Fill a new table from the store. Returns the number of entries loaded.
 
-        Loaded entries have ``last_activity`` 0, as in firmware: they are
-        known, not active, until the client logs in again. The replay
-        watermark also starts at 0, as firmware keeps it in RAM only.
+        Call once, on a fresh ACL: loaded entries replace live ones. They have
+        ``last_activity`` 0, as in firmware: known, not active, until the
+        client logs in again. The replay watermark also starts at 0, as
+        firmware keeps it in RAM only.
+
+        Every stored entry is loaded even past ``max_clients``: lowering the
+        limit must not silently revoke provisioned grants. An over-full table
+        still evicts non-admins for newcomers and refuses once all are admins.
         """
         if not self._persistence_enabled():
             return 0
-        try:
-            rows = self._store.load_acl_entries(self._identity_pubkey_hex(), self._identity_label)
-        except Exception as e:
-            logger.error(f"Failed to load ACL for '{self._identity_label}': {e}")
-            return 0
-
-        loaded = 0
-        for row in rows:
+        with self._lock:
             try:
-                pub_key = bytes.fromhex(row["client_pubkey"])
-                permissions = int(row["permissions"]) & 0xFF
-                if len(pub_key) != PUB_KEY_SIZE or permissions == 0:
+                rows = self._store.load_acl_entries(
+                    self._store_key,
+                    adopt_label=self._identity_label if self._adopt_by_label else None,
+                )
+            except Exception as e:
+                logger.error(f"Failed to load ACL for '{self._identity_label}': {e}")
+                return 0
+
+            loaded = 0
+            for row in rows:
+                try:
+                    pub_key = bytes.fromhex(row["client_pubkey"])
+                    permissions = int(row["permissions"]) & 0xFF
+                    if len(pub_key) != PUB_KEY_SIZE or permissions == 0:
+                        continue
+                    identity = Identity(pub_key)
+                except Exception:
+                    logger.warning(
+                        f"Skipping malformed ACL row for '{self._identity_label}': {row}"
+                    )
                     continue
-                identity = Identity(pub_key)
-            except Exception:
-                logger.warning(f"Skipping malformed ACL row for '{self._identity_label}': {row}")
-                continue
-            client = ClientInfo(identity, permissions)
-            client.shared_secret = self._derive_secret(pub_key)
-            self.clients[pub_key] = client
-            self._persisted[pub_key] = permissions
-            loaded += 1
+                client = ClientInfo(identity, permissions)
+                client.shared_secret = self._derive_secret(pub_key)
+                self.clients[pub_key] = client
+                self._persisted[pub_key] = permissions
+                loaded += 1
 
         if loaded:
             logger.info(
                 f"Loaded {loaded} ACL entr{'y' if loaded == 1 else 'ies'} for '{self._identity_label}'"
             )
+        if loaded > self.max_clients:
+            logger.warning(
+                f"ACL for '{self._identity_label}' holds {loaded} stored entries, over "
+                f"max_clients={self.max_clients}; raise max_clients or remove entries"
+            )
         return loaded
+
+    def retarget_store(self, identity_pubkey_hex: str, identity_label: str) -> None:
+        """Point later writes at the rows ``move_acl_identity`` moved to a new key."""
+        with self._lock:
+            self._store_key = identity_pubkey_hex.lower()
+            self._identity_label = identity_label
+
+    @property
+    def store_key(self) -> Optional[str]:
+        return self._store_key
+
+    @property
+    def identity_pubkey_hex(self) -> Optional[str]:
+        """Public key of the local identity this ACL derives secrets with."""
+        if self._local_identity is None:
+            return None
+        return bytes(self._local_identity.get_public_key()[:PUB_KEY_SIZE]).hex()
 
     def _should_persist(self, client: "ClientInfo") -> bool:
         if client.permissions == 0:
@@ -183,35 +231,44 @@ class ACL:
         return self._persist_filter is None or bool(self._persist_filter(client))
 
     def _sync_entry(self, pub_key: bytes) -> None:
-        """Write one entry's current state to the store if it changed."""
+        """Write one entry's current state to the store if it changed.
+
+        Raises ACLStoreError when the write fails, leaving the record of what
+        is stored untouched so the next change retries.
+        """
         if not self._persistence_enabled():
             return
         client = self.clients.get(pub_key)
         wanted = client.permissions if client is not None and self._should_persist(client) else None
         if self._persisted.get(pub_key) == wanted:
             return
-
-        identity_hex = self._identity_pubkey_hex()
-        if wanted is None:
-            ok = self._store.delete_acl_entry(identity_hex, pub_key.hex())
-        else:
-            ok = self._store.upsert_acl_entry(
-                identity_hex, self._identity_label, pub_key.hex(), wanted
+        try:
+            if wanted is None:
+                self._store.delete_acl_entry(self._store_key, pub_key.hex())
+            else:
+                self._store.upsert_acl_entry(
+                    self._store_key, self._identity_label, pub_key.hex(), wanted
+                )
+        except Exception as e:
+            logger.error(
+                f"Failed to save ACL entry {pub_key[:6].hex()}... for '{self._identity_label}': {e}"
             )
-        # On a failed write, leave the cache as it was so the next change retries.
-        if ok is False:
-            return
+            raise ACLStoreError(str(e)) from e
         if wanted is None:
             self._persisted.pop(pub_key, None)
         else:
             self._persisted[pub_key] = wanted
+
+    def is_persisted(self, pub_key: bytes) -> bool:
+        """Whether this entry is in the store, so it survives a restart."""
+        return bytes(pub_key[:PUB_KEY_SIZE]) in self._persisted
 
     # ------------------------------------------------------------------
     # Table management
     # ------------------------------------------------------------------
 
     def _put_client(self, identity: Identity) -> Optional["ClientInfo"]:
-        """Find or add a client, firmware ``putClient``.
+        """Find or add a client, firmware ``putClient``. Call under the lock.
 
         When the table is full the least recently active non-admin is evicted.
         Firmware evicts its last slot, which may be an admin, when every entry
@@ -226,11 +283,19 @@ class ACL:
         if len(self.clients) >= self.max_clients:
             candidates = [(k, c) for k, c in self.clients.items() if not c.is_admin()]
             if not candidates:
-                logger.warning("ACL full and every entry is an admin, cannot add client")
+                logger.error(
+                    f"ACL for '{self._identity_label}' is full: all {len(self.clients)} "
+                    f"entries are admins (max_clients={self.max_clients}); cannot add client"
+                )
                 return None
             evict_key, _ = min(candidates, key=lambda kc: kc[1].last_activity)
             del self.clients[evict_key]
-            self._sync_entry(evict_key)
+            try:
+                self._sync_entry(evict_key)
+            except ACLStoreError:
+                # Still stored; it returns after a restart. Evicting it from
+                # memory must not block the newcomer.
+                pass
             logger.info(f"ACL full, evicted least active client {evict_key[:6].hex()}...")
 
         client = ClientInfo(identity, 0)
@@ -243,48 +308,66 @@ class ACL:
         A guest role deletes the first entry whose key starts with ``pub_key``,
         so a prefix is enough. Any other role needs the full key, finds or adds
         the entry, and stores the whole permissions byte, not just the role.
+
+        Returns False for invalid parameters, as firmware. Raises ACLStoreError
+        when the change cannot be stored; the table is then left as it was.
         """
         permissions &= 0xFF
         pub_key = bytes(pub_key)
-        if role_of(permissions) == PERM_ACL_GUEST:
-            # Firmware matches an empty prefix against the first entry and
-            # deletes it. Refuse instead: "setperm  0" should not drop someone.
-            if not pub_key:
-                return False
-            match = next((k for k in self.clients if k.startswith(pub_key)), None)
-            if match is None:
-                return False
-            del self.clients[match]
-            self._sync_entry(match)
-            logger.info(f"setperm: removed {match[:6].hex()}... from ACL")
-            return True
+        with self._lock:
+            if role_of(permissions) == PERM_ACL_GUEST:
+                # Firmware matches an empty prefix against the first entry and
+                # deletes it. Refuse instead: "setperm  0" should not drop someone.
+                if not pub_key:
+                    return False
+                match = next((k for k in self.clients if k.startswith(pub_key)), None)
+                if match is None:
+                    return False
+                removed = self.clients.pop(match)
+                try:
+                    self._sync_entry(match)
+                except ACLStoreError:
+                    self.clients[match] = removed
+                    raise
+                logger.info(f"setperm: removed {match[:6].hex()}... from ACL")
+                return True
 
-        if len(pub_key) < PUB_KEY_SIZE:
-            return False
-        pub_key = pub_key[:PUB_KEY_SIZE]
-        try:
-            identity = Identity(pub_key)
-        except Exception:
-            # Not a valid ed25519 key. Firmware stores any 32 bytes, but such
-            # an entry could never log in, and Identity() refuses it.
-            logger.info(f"setperm: {pub_key[:6].hex()}... is not a valid public key")
-            return False
-        client = self._put_client(identity)
-        if client is None:
-            return False
-        client.permissions = permissions
-        client.shared_secret = self._derive_secret(pub_key) or client.shared_secret
-        self._sync_entry(pub_key)
-        logger.info(f"setperm: {pub_key[:6].hex()}... permissions=0x{permissions:02X}")
-        return True
+            if len(pub_key) < PUB_KEY_SIZE:
+                return False
+            pub_key = pub_key[:PUB_KEY_SIZE]
+            try:
+                identity = Identity(pub_key)
+            except Exception:
+                # Not a valid ed25519 key. Firmware stores any 32 bytes, but such
+                # an entry could never log in, and Identity() refuses it.
+                logger.info(f"setperm: {pub_key[:6].hex()}... is not a valid public key")
+                return False
+            existing = self.clients.get(pub_key)
+            previous = existing.permissions if existing is not None else None
+            client = self._put_client(identity)
+            if client is None:
+                return False
+            client.permissions = permissions
+            client.shared_secret = self._derive_secret(pub_key) or client.shared_secret
+            try:
+                self._sync_entry(pub_key)
+            except ACLStoreError:
+                if previous is None:
+                    self.clients.pop(pub_key, None)
+                else:
+                    client.permissions = previous
+                raise
+            logger.info(f"setperm: {pub_key[:6].hex()}... permissions=0x{permissions:02X}")
+            return True
 
     def format_acl_lines(self) -> List[str]:
         """Rows for ``get acl``: ``"%02X <pubkey>"`` for each entry with permissions."""
-        return [
-            f"{client.permissions:02X} {key.hex().upper()}"
-            for key, client in self.clients.items()
-            if client.permissions != 0
-        ]
+        with self._lock:
+            return [
+                f"{client.permissions:02X} {key.hex().upper()}"
+                for key, client in self.clients.items()
+                if client.permissions != 0
+            ]
 
     def _is_replay(self, client: ClientInfo, timestamp: int) -> bool:
         if timestamp <= client.last_timestamp:
@@ -321,6 +404,27 @@ class ACL:
         timestamp: int,
         sync_since: int = None,
         target_identity_hash: int = None,
+        target_identity_name: str = None,
+        target_identity_config: dict = None,
+    ) -> tuple[bool, int]:
+        with self._lock:
+            return self._authenticate_client_locked(
+                client_identity,
+                shared_secret,
+                password,
+                timestamp,
+                sync_since=sync_since,
+                target_identity_name=target_identity_name,
+                target_identity_config=target_identity_config,
+            )
+
+    def _authenticate_client_locked(
+        self,
+        client_identity: Identity,
+        shared_secret: bytes,
+        password: str,
+        timestamp: int,
+        sync_since: int = None,
         target_identity_name: str = None,
         target_identity_config: dict = None,
     ) -> tuple[bool, int]:
@@ -427,7 +531,12 @@ class ACL:
         client.permissions |= permissions
         # Firmware saves after any non-guest password login. _sync_entry writes
         # only when the stored permissions changed, and a guest has none to store.
-        self._sync_entry(pub_key)
+        # A failed write does not fail the login: the session is valid, and the
+        # grant is written by the next change that succeeds.
+        try:
+            self._sync_entry(pub_key)
+        except ACLStoreError:
+            pass
 
         logger.info(f"Login success! Role: {client.role_name()}")
         return True, client.permissions
@@ -439,12 +548,19 @@ class ACL:
         return len(self.clients)
 
     def get_all_clients(self):
-        return list(self.clients.values())
+        with self._lock:
+            return list(self.clients.values())
 
     def remove_client(self, pub_key: bytes) -> bool:
-        key = bytes(pub_key[:PUB_KEY_SIZE])
-        if key in self.clients:
-            del self.clients[key]
-            self._sync_entry(key)
+        """Remove an entry, and its stored copy. Raises ACLStoreError, restoring it, on failure."""
+        key = pub_key[:PUB_KEY_SIZE]
+        with self._lock:
+            removed = self.clients.pop(key, None)
+            if removed is None:
+                return False
+            try:
+                self._sync_entry(key)
+            except ACLStoreError:
+                self.clients[key] = removed
+                raise
             return True
-        return False
