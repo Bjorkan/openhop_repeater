@@ -6872,11 +6872,17 @@ class APIEndpoints:
             needs_reload = data.get("identity_key") or "new_name" in data
             # A room with no password is not registered for logins, so a live
             # reload would leave its login ACL under the old name; it waits
-            # for a restart instead.
+            # for a restart instead. Giving such a room a password is a
+            # reload too: it has no login handler or ACL until it registers.
             room_settings = identity.get("settings") or {}
             can_log_in = bool(
                 room_settings.get("admin_password") or room_settings.get("guest_password")
             )
+            old_settings = snapshot.get("settings") or {}
+            could_log_in = bool(
+                old_settings.get("admin_password") or old_settings.get("guest_password")
+            )
+            needs_reload = needs_reload or (can_log_in and not could_log_in)
 
             if needs_reload and can_log_in and self.daemon_instance:
                 try:
@@ -6931,9 +6937,15 @@ class APIEndpoints:
                             )
                         finally:
                             if not registration_success and previous is not None:
-                                identity_manager.register_identity(
+                                # Refused only when the new entry already holds
+                                # the hash, i.e. it did register before failing.
+                                if not identity_manager.register_identity(
                                     old_name, previous[0], previous[1], previous[2]
-                                )
+                                ):
+                                    logger.warning(
+                                        f"Hot reload: could not restore '{old_name}'; "
+                                        f"it stays registered as '{final_name}'"
+                                    )
                         if registration_success:
                             logger.info(
                                 f"Hot reload: Re-registered identity '{final_name}' with all systems"
@@ -7302,6 +7314,9 @@ class APIEndpoints:
         if login_helper is not None:
             login_helper.move_room_acl(old_name, old_pubkey, new_pubkey, new_name, commit)
             return
+        # No login helper (a daemon still starting, or a test double): move the
+        # rows in the store directly. LoginHelper.move_room_acl holds the same
+        # guard for the usual path, against the store its ACLs were built with.
         storage = getattr(getattr(self.daemon_instance, "repeater_handler", None), "storage", None)
         sqlite_handler = getattr(storage, "sqlite_handler", None)
         if sqlite_handler is None and old_pubkey != new_pubkey:

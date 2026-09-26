@@ -554,3 +554,17 @@ def test_delete_identity_frees_the_name_and_hash(db, request_ctx):
     identity = LocalIdentity(seed=bytes.fromhex("11" * 32))
     # Re-creating the room registers at once instead of conflicting until a restart.
     assert daemon.identity_manager.registration_error("room-a", identity, "room_server") is None
+
+
+def test_giving_a_passwordless_room_a_password_registers_it_live(db, request_ctx):
+    daemon = _LiveDaemon(db, "room-a", "11" * 32)
+    api = _api(daemon, daemon.config)
+    request_ctx.method = "PUT"
+    request_ctx.json = {"name": "room-a", "settings": {"admin_password": "", "guest_password": ""}}
+    api.update_identity()
+
+    request_ctx.method = "PUT"
+    request_ctx.json = {"name": "room-a", "settings": {"admin_password": "new-admin"}}
+    result = api.update_identity()
+    assert "no reload needed" not in result["message"]
+    assert daemon.login_helper.get_acl_by_name("room-a").admin_password == "new-admin"
