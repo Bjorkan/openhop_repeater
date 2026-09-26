@@ -31,6 +31,12 @@ class _FakeClient:
         self.out_path = bytearray(out_path)
         self.out_path_len = out_path_len
         self.sync_since = 0
+        # Logged in: the sync loop skips entries that have not been active.
+        self.last_activity = int(time.time())
+        self.permissions = 0
+
+    def is_admin(self):
+        return self.permissions & 3 == 3
 
 
 class _FakeACL:
@@ -40,6 +46,9 @@ class _FakeACL:
 
     def get_all_clients(self):
         return list(self._clients)
+
+    def get_client(self, pub_key):
+        return next((c for c in self._clients if c.id.get_public_key() == pub_key), None)
 
 
 class _FakeDB:

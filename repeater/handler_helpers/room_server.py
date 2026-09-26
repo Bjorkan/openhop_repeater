@@ -197,6 +197,7 @@ class RoomServer:
                 send_advert_callback=send_room_advert,
                 identity=local_identity,
                 storage_handler=sqlite_handler,
+                acl=acl,
             )
             logger.info(f"Room '{room_name}': Initialized CLI handler with identity and storage")
 
@@ -618,9 +619,13 @@ class RoomServer:
                         last_activity=0,  # Mark as evicted
                     )
 
-                    # Remove from ACL
+                    # Remove from ACL. An admin stays: its entry is persisted,
+                    # like firmware's, and it is only paused, not dropped, until
+                    # it logs in again.
                     client_pubkey = bytes.fromhex(client_pubkey_hex)
-                    self.acl.remove_client(client_pubkey)
+                    acl_client = self.acl.get_client(client_pubkey)
+                    if acl_client is None or not acl_client.is_admin():
+                        self.acl.remove_client(client_pubkey)
 
                     logger.info(
                         f"Room '{self.room_name}': Evicted client "
@@ -697,6 +702,12 @@ class RoomServer:
                     client = all_clients[self.next_client_idx]
                     self.next_client_idx = (self.next_client_idx + 1) % len(all_clients)
                     clients_checked += 1
+
+                    # An entry loaded from the stored ACL, or added by setperm,
+                    # has not logged in since: firmware skips clients with no
+                    # activity, so a restart does not push to every admin.
+                    if not getattr(client, "last_activity", 0):
+                        continue
 
                     # Get client sync state
                     sync_state = self.db.get_client_sync(

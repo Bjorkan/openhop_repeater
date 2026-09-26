@@ -63,7 +63,7 @@ class LoginHelper:
         hash_byte = identity.get_public_key()[0]
 
         # Create ACL for this identity
-        from repeater.handler_helpers.acl import ACL
+        from repeater.handler_helpers.acl import ACL, acl_identity_label
 
         # Get security config for this identity
         if identity_type == "room_server":
@@ -110,13 +110,20 @@ class LoginHelper:
                 f"max_clients={final_security['max_clients']}"
             )
 
-        # Create ACL for this identity
+        # Create ACL for this identity. Entries persist in the database, keyed
+        # by the identity's full public key; firmware's repeater keeps every
+        # entry with permissions, its room server only admins (saveFilter).
         identity_acl = ACL(
             max_clients=final_security["max_clients"],
             admin_password=final_security["admin_password"],
             guest_password=final_security["guest_password"],
             allow_read_only=final_security["allow_read_only"],
+            store=self.sqlite_handler,
+            local_identity=identity,
+            identity_label=acl_identity_label(name, identity_type),
+            persist_filter=(lambda c: c.is_admin()) if identity_type == "room_server" else None,
         )
+        identity_acl.load()
 
         self.acls[hash_byte] = identity_acl
         if identity_type != "room_server":
