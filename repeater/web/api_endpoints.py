@@ -149,8 +149,9 @@ POLICY_GROUP_KINDS = {
 
 # ACL (Access Control List)
 # GET    /api/acl_info - Get ACL configuration and stats for all identities
-# GET    /api/acl_clients?identity_hash=0x42&identity_name=repeater - List authenticated clients
-# POST   /api/acl_remove_client {"public_key": "...", "identity_hash": "0x42"} - Remove client from ACL
+# GET    /api/acl_clients?identity_hash=0x42&identity_name=repeater - List ACL entries
+# POST   /api/acl_remove_client {"client_pubkey": "...", "identity_name": "repeater"} - Remove client from ACL
+# POST   /api/acl_set_permissions {"identity_name": "repeater", "client_pubkey": "...", "permissions": 3} - Add/change an ACL entry
 # GET    /api/acl_stats - Overall ACL statistics
 
 # Room Server
@@ -6758,6 +6759,7 @@ class APIEndpoints:
 
             # Update fields
             identity = room_servers[identity_index]
+            old_identity_key = identity.get("identity_key")
 
             if "new_name" in data:
                 new_name = data["new_name"]
@@ -6816,6 +6818,22 @@ class APIEndpoints:
                 return self._error("Failed to save configuration to file")
 
             logger.info(f"Updated identity: {name_s}")
+
+            # Carry the room's stored ACL over to its new key and name. Room
+            # servers are not adopted by label, so this is the only path.
+            login_helper = getattr(self.daemon_instance, "login_helper", None)
+            if login_helper is not None and hasattr(login_helper, "move_room_acl"):
+                old_pubkey = derive_companion_public_key_hex(old_identity_key)
+                new_pubkey = derive_companion_public_key_hex(identity.get("identity_key"))
+                if old_pubkey and new_pubkey and (old_pubkey != new_pubkey or "new_name" in data):
+                    try:
+                        login_helper.move_room_acl(old_pubkey, new_pubkey, identity["name"])
+                    except Exception as e:
+                        logger.error(f"Failed to move the ACL of '{name_s}': {e}")
+                        return self._error(
+                            "Identity updated, but its access list could not be moved "
+                            f"to the new key or name: {e}"
+                        )
 
             # Hot reload - re-register identity if key changed or name changed
             registration_success = False
@@ -6982,8 +7000,9 @@ class APIEndpoints:
 
             logger.info(f"Deleted identity: {name_s}")
 
-            # Drop its stored ACL, so a room created later under this name does
-            # not inherit the deleted room's admins.
+            # Drop its stored ACL. Room servers are not adopted by label, so a
+            # later room with the same name cannot inherit it either way; a
+            # failure here only leaves rows no identity will load.
             repeater_handler = (
                 getattr(self.daemon_instance, "repeater_handler", None)
                 if self.daemon_instance
@@ -6992,13 +7011,14 @@ class APIEndpoints:
             storage = getattr(repeater_handler, "storage", None)
             sqlite_handler = getattr(storage, "sqlite_handler", None)
             if sqlite_handler is not None:
-                from repeater.handler_helpers.acl import acl_identity_label
-
                 for entry in removed:
-                    sqlite_handler.delete_acl_identity(
-                        derive_companion_public_key_hex(entry.get("identity_key")),
-                        acl_identity_label(name_s, "room_server"),
-                    )
+                    pubkey = derive_companion_public_key_hex(entry.get("identity_key"))
+                    if not pubkey:
+                        continue
+                    try:
+                        sqlite_handler.delete_acl_identity(pubkey)
+                    except Exception as e:
+                        logger.warning(f"Could not drop the stored ACL of '{name_s}': {e}")
 
             unregister_success = False
             if self.daemon_instance:
@@ -7207,6 +7227,50 @@ class APIEndpoints:
 
     # ========== ACL (Access Control List) Endpoints ==========
 
+    @staticmethod
+    def _acl_counts(acl) -> dict:
+        """Entry counts for one ACL. Provisioned entries are not sessions."""
+        clients = acl.get_all_clients()
+        is_persisted = getattr(acl, "is_persisted", None)
+        return {
+            # Entries that logged in (or sent a message) since they were loaded.
+            "authenticated_clients": sum(1 for c in clients if c.last_activity),
+            "acl_entries": len(clients),
+            "stored_entries": sum(
+                1 for c in clients if is_persisted and is_persisted(c.id.get_public_key())
+            ),
+        }
+
+    def _acl_owners(self) -> list:
+        """(name, type, identity, acl) for each identity with an ACL.
+
+        Looked up by registered name, not the 1-byte hash that two identities
+        can share.
+        """
+        daemon = self.daemon_instance
+        login_helper = getattr(daemon, "login_helper", None)
+        if login_helper is None:
+            return []
+        by_name = getattr(login_helper, "get_acl_by_name", None)
+        by_hash = login_helper.get_acl_dict()
+
+        def lookup(name, identity):
+            acl = by_name(name) if by_name else None
+            return acl if acl is not None else by_hash.get(identity.get_public_key()[0])
+
+        owners = []
+        if getattr(daemon, "local_identity", None):
+            acl = lookup("repeater", daemon.local_identity)
+            if acl is not None:
+                owners.append(("repeater", "repeater", daemon.local_identity, acl))
+        for name, identity, _config in daemon.identity_manager.get_identities_by_type(
+            "room_server"
+        ):
+            acl = lookup(name, identity)
+            if acl is not None:
+                owners.append((name, "room_server", identity, acl))
+        return owners
+
     @cherrypy.expose
     @cherrypy.tools.json_out()
     def acl_info(self):
@@ -7251,7 +7315,7 @@ class APIEndpoints:
                                 self.daemon_instance.local_identity.get_public_key()
                             ),
                             "max_clients": repeater_acl.max_clients,
-                            "authenticated_clients": repeater_acl.get_num_clients(),
+                            **self._acl_counts(repeater_acl),
                             "has_admin_password": bool(repeater_acl.admin_password),
                             "has_guest_password": bool(repeater_acl.guest_password),
                             "allow_read_only": repeater_acl.allow_read_only,
@@ -7270,7 +7334,7 @@ class APIEndpoints:
                             "type": "room_server",
                             "hash": self._fmt_hash(identity.get_public_key()),
                             "max_clients": acl.max_clients,
-                            "authenticated_clients": acl.get_num_clients(),
+                            **self._acl_counts(acl),
                             "has_admin_password": bool(acl.admin_password),
                             "has_guest_password": bool(acl.guest_password),
                             "allow_read_only": acl.allow_read_only,
@@ -7336,19 +7400,16 @@ class APIEndpoints:
     @cherrypy.tools.json_out()
     def acl_clients(self, identity_hash=None, identity_name=None):
         """
-        GET /api/acl_clients - Get authenticated clients
+        GET /api/acl_clients - List ACL entries
 
         Query parameters:
         - identity_hash: Filter by identity hash (e.g., "0x42")
-        - identity_name: Filter by identity name (e.g., "repeater" or room server name)
+        - identity_name: Filter by identity name ("repeater" or a room server's name)
 
-        Returns list of authenticated clients with:
-        - Public key (truncated)
-        - Full address
-        - Permissions (admin/guest)
-        - Last activity timestamp
-        - Last login timestamp
-        - Identity they're authenticated to
+        Each entry is a client known to an identity's ACL: a session from a
+        login, or an entry provisioned with setperm that may not have logged
+        in yet (``last_activity`` 0). ``persisted`` says whether it survives a
+        restart.
         """
         # Enable CORS for this endpoint only if configured
         self._set_cors_headers()
@@ -7360,44 +7421,8 @@ class APIEndpoints:
             if not self.daemon_instance or not hasattr(self.daemon_instance, "login_helper"):
                 return self._error("Login helper not available")
 
-            login_helper = self.daemon_instance.login_helper
-            identity_manager = self.daemon_instance.identity_manager
-            acl_dict = login_helper.get_acl_dict()
-
-            # Build a mapping of hash to identity info
-            identity_map = {}
-
-            # Add repeater
-            if self.daemon_instance.local_identity:
-                repeater_hash = self.daemon_instance.local_identity.get_public_key()[0]
-                identity_map[repeater_hash] = {
-                    "name": "repeater",
-                    "type": "repeater",
-                    "hash": self._fmt_hash(self.daemon_instance.local_identity.get_public_key()),
-                }
-
-            # Add room servers
-            for name, identity, config in identity_manager.get_identities_by_type("room_server"):
-                hash_byte = identity.get_public_key()[0]
-                identity_map[hash_byte] = {
-                    "name": name,
-                    "type": "room_server",
-                    "hash": self._fmt_hash(identity.get_public_key()),
-                }
-
-            # Add companions
-            for name, identity, config in identity_manager.get_identities_by_type("companion"):
-                hash_byte = identity.get_public_key()[0]
-                identity_map[hash_byte] = {
-                    "name": name,
-                    "type": "companion",
-                    "hash": f"0x{hash_byte:02X}",
-                }
-
-            # Filter by identity if requested
             target_hash = None
             if identity_hash:
-                # Convert "0x42" to int
                 try:
                     target_hash = (
                         int(identity_hash, 16)
@@ -7406,66 +7431,49 @@ class APIEndpoints:
                     )
                 except ValueError:
                     return self._error(f"Invalid identity_hash format: {identity_hash}")
-            elif identity_name:
-                # Find hash by name
-                for hash_byte, info in identity_map.items():
-                    if info["name"] == identity_name:
-                        target_hash = hash_byte
-                        break
-                if target_hash is None:
-                    return self._error(f"Identity '{identity_name}' not found")
 
-            # Collect clients
+            owners = self._acl_owners()
+            if identity_name and not any(name == identity_name for name, *_ in owners):
+                return self._error(f"Identity '{identity_name}' not found")
+
             clients_list = []
-
-            logger.info(f"ACL dict has {len(acl_dict)} identities")
-
-            for hash_byte, acl in acl_dict.items():
-                # Skip if filtering by specific identity
-                if target_hash is not None and hash_byte != target_hash:
+            for name, identity_type, identity, acl in owners:
+                identity_pubkey = identity.get_public_key()
+                if identity_name and name != identity_name:
+                    continue
+                if target_hash is not None and identity_pubkey[0] != target_hash:
                     continue
 
-                identity_info = identity_map.get(
-                    hash_byte, {"name": "unknown", "type": "unknown", "hash": f"0x{hash_byte:02X}"}
-                )
-
-                all_clients = acl.get_all_clients()
-                logger.info(
-                    f"Identity {identity_info['name']} (0x{hash_byte:02X}) has {len(all_clients)} clients"
-                )
-
-                for client in all_clients:
+                is_persisted = getattr(acl, "is_persisted", None)
+                for client in acl.get_all_clients():
                     try:
                         pub_key = client.id.get_public_key()
-
-                        # Compute address from public key (first byte of SHA256)
-                        address_bytes = CryptoUtils.sha256(pub_key)[:1]
-
+                        permissions = getattr(client, "permissions", 0)
                         clients_list.append(
                             {
                                 "public_key": pub_key[:8].hex() + "..." + pub_key[-4:].hex(),
                                 "public_key_full": pub_key.hex(),
-                                "address": address_bytes.hex(),
+                                # Compute address from public key (first byte of SHA256)
+                                "address": CryptoUtils.sha256(pub_key)[:1].hex(),
                                 # Accurate role name: with the guest password
                                 # split (repeater=guest, room server=read_write)
                                 # an "admin or guest" label would hide the
                                 # difference between the non-admin roles.
-                                # Read the byte rather than calling a method:
-                                # ACL clients are duck-typed in several places.
-                                "permissions": acl_role_name(getattr(client, "permissions", 0)),
+                                "permissions": acl_role_name(permissions),
+                                "permissions_value": permissions & 0xFF,
+                                "persisted": bool(is_persisted and is_persisted(pub_key)),
                                 "last_activity": client.last_activity,
                                 "last_login_success": client.last_login_success,
                                 "last_timestamp": client.last_timestamp,
-                                "identity_name": identity_info["name"],
-                                "identity_type": identity_info["type"],
-                                "identity_hash": identity_info["hash"],
+                                "identity_name": name,
+                                "identity_type": identity_type,
+                                "identity_hash": self._fmt_hash(identity_pubkey),
+                                "identity_pubkey": identity_pubkey.hex(),
                             }
                         )
                     except Exception as client_error:
                         logger.error(f"Error processing client: {client_error}", exc_info=True)
                         continue
-
-            logger.info(f"Returning {len(clients_list)} total clients")
 
             return self._success(
                 {
@@ -7483,16 +7491,29 @@ class APIEndpoints:
             logger.error(f"Error getting ACL clients: {e}")
             return self._error(e)
 
+    def _acl_targets(self, identity_name, identity_hash) -> list:
+        """The ACLs a remove/set request names: by name, by hash, or all of them."""
+        owners = self._acl_owners()
+        if identity_name:
+            return [o for o in owners if o[0] == identity_name]
+        if identity_hash:
+            target = (
+                int(identity_hash, 16) if identity_hash.startswith("0x") else int(identity_hash)
+            )
+            return [o for o in owners if o[2].get_public_key()[0] == target]
+        return owners
+
     @cherrypy.expose
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
     def acl_remove_client(self):
         """
-        POST /api/acl_remove_client - Remove an authenticated client from ACL
+        POST /api/acl_remove_client - Remove a client from an ACL, and from storage
 
         Body: {
-            "public_key": "full_hex_string",
-            "identity_hash": "0x42"  # Optional - if not provided, removes from all ACLs
+            "client_pubkey": "full_hex_string",  # "public_key" is accepted too
+            "identity_name": "repeater",         # Optional; preferred over the hash
+            "identity_hash": "0x42"              # Optional; neither = every ACL
         }
         """
         # Enable CORS for this endpoint only if configured
@@ -7508,59 +7529,137 @@ class APIEndpoints:
                 return self._error("Login helper not available")
 
             data = cherrypy.request.json or {}
-            public_key_hex = data.get("public_key")
-            identity_hash_str = data.get("identity_hash")
-
+            # The published schema names it client_pubkey; public_key is what
+            # this endpoint read before, so both are accepted.
+            public_key_hex = data.get("client_pubkey") or data.get("public_key")
             if not public_key_hex:
-                return self._error("Missing required field: public_key")
-
-            # Convert hex to bytes
+                return self._error("Missing required field: client_pubkey")
             try:
                 public_key = bytes.fromhex(public_key_hex)
             except ValueError:
-                return self._error("Invalid public_key format (must be hex string)")
+                return self._error("Invalid client_pubkey format (must be hex string)")
 
-            login_helper = self.daemon_instance.login_helper
-            acl_dict = login_helper.get_acl_dict()
+            try:
+                targets = self._acl_targets(data.get("identity_name"), data.get("identity_hash"))
+            except ValueError:
+                return self._error(f"Invalid identity_hash format: {data.get('identity_hash')}")
 
-            # Determine which ACLs to remove from
-            target_hashes = []
-            if identity_hash_str:
-                try:
-                    target_hash = (
-                        int(identity_hash_str, 16)
-                        if identity_hash_str.startswith("0x")
-                        else int(identity_hash_str)
-                    )
-                    target_hashes = [target_hash]
-                except ValueError:
-                    return self._error(f"Invalid identity_hash format: {identity_hash_str}")
-            else:
-                # Remove from all ACLs
-                target_hashes = list(acl_dict.keys())
+            from repeater.handler_helpers.acl import ACLStoreError
 
-            removed_count = 0
             removed_from = []
+            for name, _type, identity, acl in targets:
+                try:
+                    if acl.remove_client(public_key):
+                        removed_from.append(name)
+                except ACLStoreError as e:
+                    return self._error(f"Could not remove the stored entry from '{name}': {e}")
 
-            for hash_byte in target_hashes:
-                acl = acl_dict.get(hash_byte)
-                if acl and acl.remove_client(public_key):
-                    removed_count += 1
-                    removed_from.append(f"0x{hash_byte:02X}")
-
-            if removed_count > 0:
-                logger.info(f"Removed client {public_key[:6].hex()}... from {removed_count} ACL(s)")
-                return self._success(
-                    {"removed_count": removed_count, "removed_from": removed_from},
-                    message=f"Client removed from {removed_count} ACL(s)",
+            if removed_from:
+                logger.info(
+                    f"Removed client {public_key[:6].hex()}... from {', '.join(removed_from)}"
                 )
-            else:
-                return self._error("Client not found in any ACL")
+                return self._success(
+                    {"removed_count": len(removed_from), "removed_from": removed_from},
+                    message=f"Client removed from {len(removed_from)} ACL(s)",
+                )
+            return self._error("Client not found in any ACL")
 
         except cherrypy.HTTPError:
             raise
         except Exception as e:
             logger.error(f"Error removing client from ACL: {e}")
+            return self._error(e)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
+    def acl_set_permissions(self):
+        """
+        POST /api/acl_set_permissions - Add or change an ACL entry, as `setperm`
+
+        Body: {
+            "identity_name": "repeater",   # "repeater" or a room server's name
+            "client_pubkey": "<64 hex>",
+            "permissions": 3               # 1 read-only, 2 read-write, 3 admin
+        }
+
+        The entry is stored, so the key logs in with a blank password after a
+        restart. A guest role (low two bits 0) is refused here; remove an
+        entry with /api/acl_remove_client instead. On a room server only
+        admins are stored, as in firmware.
+        """
+        self._set_cors_headers()
+        if cherrypy.request.method == "OPTIONS":
+            return ""
+
+        try:
+            self._require_post()
+            if not self.daemon_instance or not hasattr(self.daemon_instance, "login_helper"):
+                return self._error("Login helper not available")
+
+            data = cherrypy.request.json or {}
+            identity_name = str(data.get("identity_name") or "").strip()
+            if not identity_name:
+                return self._error("Missing required field: identity_name")
+
+            public_key_hex = str(data.get("client_pubkey") or "").strip().lower()
+            if len(public_key_hex) != 64:
+                return self._error("client_pubkey must be a full 64-character hex public key")
+            try:
+                public_key = bytes.fromhex(public_key_hex)
+            except ValueError:
+                return self._error("client_pubkey must be hex")
+
+            permissions = data.get("permissions")
+            if isinstance(permissions, bool) or not isinstance(permissions, int):
+                return self._error("permissions must be an integer 1-255")
+            if not 1 <= permissions <= 255 or permissions & 3 == 0:
+                return self._error(
+                    "permissions must set a role (low two bits 1-3); "
+                    "use /api/acl_remove_client to remove an entry"
+                )
+
+            targets = self._acl_targets(identity_name, None)
+            if not targets:
+                return self._error(f"Identity '{identity_name}' not found")
+            _name, identity_type, _identity, acl = targets[0]
+
+            from repeater.handler_helpers.acl import ACLStoreError
+
+            try:
+                applied = acl.apply_permissions(public_key, permissions)
+            except ACLStoreError as e:
+                return self._error(f"Could not store the entry: {e}")
+            if not applied:
+                return self._error(
+                    "Could not add the entry: the key is not a valid public key, "
+                    "or the access list is full of admins"
+                )
+
+            persisted = acl.is_persisted(public_key)
+            logger.info(
+                f"ACL: {public_key[:6].hex()}... set to 0x{permissions:02X} on '{identity_name}'"
+            )
+            return self._success(
+                {
+                    "identity_name": identity_name,
+                    "identity_type": identity_type,
+                    "client_pubkey": public_key_hex,
+                    "permissions": acl_role_name(permissions),
+                    "permissions_value": permissions,
+                    "persisted": persisted,
+                },
+                message=(
+                    "Entry saved"
+                    if persisted
+                    else "Entry added until restart (room servers keep admins only)"
+                ),
+            )
+
+        except cherrypy.HTTPError:
+            raise
+        except Exception as e:
+            logger.error(f"Error setting ACL permissions: {e}")
             return self._error(e)
 
     @cherrypy.expose

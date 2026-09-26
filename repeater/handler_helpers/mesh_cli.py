@@ -381,6 +381,10 @@ class MeshCLI:
                 "  perm 0 removes the entry (a key prefix is enough)\n"
                 "  A key with an entry logs in with a blank password."
             ),
+            "get acl": (
+                "get acl \u2014 List ACL entries as '<perm-hex> <pubkey>'.\n"
+                "  Local console only, as firmware's serial port."
+            ),
             "log": "log start|stop|erase \u2014 Control logging.",
         }
         return details.get(topic, f"No detailed help for '{topic}'. Type 'help' for command list.")
@@ -832,7 +836,7 @@ class MeshCLI:
     @staticmethod
     def _atoi(text: str) -> int:
         """C ``atoi``: leading whitespace, optional sign, digits; anything else is 0."""
-        match = re.match(r"\s*([+-]?\d+)", text)
+        match = re.match(r"[ \t\n\v\f\r]*([+-]?[0-9]+)", text)
         return int(match.group(1)) if match else 0
 
     def _cmd_setperm(self, command: str) -> str:
@@ -861,9 +865,15 @@ class MeshCLI:
         if self.acl is None:
             logger.error("setperm: no ACL is attached to this CLI")
             return "Err - invalid params"
-        if not self.acl.apply_permissions(pubkey, permissions):
-            return "Err - invalid params"
-        return "OK"
+        from .acl import ACLStoreError
+
+        try:
+            applied = self.acl.apply_permissions(pubkey, permissions)
+        except ACLStoreError:
+            # Firmware saves lazily and cannot report this; we write before
+            # replying, so a grant that would vanish on restart is not "OK".
+            return "Err - failed to save"
+        return "OK" if applied else "Err - invalid params"
 
     def _cmd_get_acl(self) -> str:
         """``get acl``: the header, then ``"%02X <pubkey>"`` for each entry with permissions."""

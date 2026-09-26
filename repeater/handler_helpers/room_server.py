@@ -707,6 +707,10 @@ class RoomServer:
                     # has not logged in since: firmware skips clients with no
                     # activity, so a restart does not push to every admin.
                     if not getattr(client, "last_activity", 0):
+                        logger.debug(
+                            f"Skipping client 0x{client.id.get_public_key()[0]:02X} "
+                            f"(no activity since load)"
+                        )
                         continue
 
                     # Get client sync state

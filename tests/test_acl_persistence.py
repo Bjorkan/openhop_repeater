@@ -7,6 +7,7 @@ reboots. These tests hold the repeater to that.
 
 import asyncio
 import sqlite3
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -18,6 +19,7 @@ from openhop_core.protocol import Identity
 from repeater.data_acquisition.sqlite_handler import SQLiteHandler
 from repeater.handler_helpers.acl import (
     ACL,
+    ACLStoreError,
     PERM_ACL_ADMIN,
     PERM_ACL_GUEST,
     PERM_ACL_READ_ONLY,
@@ -48,6 +50,7 @@ def _repeater_acl(db, local, **kwargs):
         store=db,
         local_identity=local,
         identity_label="repeater",
+        adopt_by_label=True,
         **kwargs,
     )
 
@@ -322,13 +325,53 @@ def test_a_new_identity_key_keeps_the_acl(db):
     assert [r["identity_pubkey"] for r in _acl_rows(db)] == [new_key.get_public_key().hex()]
 
 
-def test_a_renamed_room_keeps_its_acl_and_a_later_key_change_still_finds_it(db):
-    key, new_key = LocalIdentity(), LocalIdentity()
+def test_a_room_is_never_adopted_by_label(db):
+    # Room servers move their rows explicitly; a new key alone, or a new room
+    # reusing a deleted room's name, starts empty.
     admin = LocalIdentity()
-    _cli(_room_acl(db, key, "old-name"))._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+    _cli(_room_acl(db, LocalIdentity()))._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
 
-    assert _room_acl(db, key, "new-name").load() == 1
-    assert _room_acl(db, new_key, "new-name").load() == 1
+    assert _room_acl(db, LocalIdentity()).load() == 0
+
+
+def test_a_room_renamed_and_rekeyed_in_one_update_keeps_its_acl(db):
+    old_key, new_key = LocalIdentity(), LocalIdentity()
+    admin = LocalIdentity()
+    helper = _login_helper(db)
+    helper.register_identity("old-name", old_key, identity_type="room_server", config=ROOM_CFG)
+    live = helper.get_acl_by_name("old-name")
+    _cli(live)._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+
+    helper.move_room_acl(old_key.get_public_key().hex(), new_key.get_public_key().hex(), "new-name")
+
+    rows = _acl_rows(db)
+    assert [(r["identity_pubkey"], r["identity_label"]) for r in rows] == [
+        (new_key.get_public_key().hex(), "room_server:new-name")
+    ]
+    # The live ACL, still on the old key until a restart, now writes to the
+    # moved rows rather than recreating them under the old key.
+    reader = LocalIdentity()
+    _cli(live)._cmd_setperm(f"setperm {reader.get_public_key().hex()} 3")
+    assert {r["identity_pubkey"] for r in _acl_rows(db)} == {new_key.get_public_key().hex()}
+
+    restarted = _room_acl(db, new_key, "new-name")
+    assert restarted.load() == 2
+    assert _login(restarted, admin, "", 1) == (True, PERM_ACL_ADMIN)
+
+
+def test_moving_onto_a_key_with_entries_keeps_the_existing_ones(db):
+    old_key, new_key = LocalIdentity(), LocalIdentity()
+    admin = LocalIdentity()
+    _cli(_room_acl(db, old_key))._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+    _cli(_room_acl(db, new_key))._cmd_setperm(f"setperm {admin.get_public_key().hex()} 131")
+
+    assert (
+        db.move_acl_identity(
+            old_key.get_public_key().hex(), new_key.get_public_key().hex(), "room_server:room-a"
+        )
+        == 0
+    )
+    assert [r["permissions"] for r in _acl_rows(db)] == [131]
 
 
 def test_deleting_an_identity_drops_its_acl(db):
@@ -336,10 +379,108 @@ def test_deleting_an_identity_drops_its_acl(db):
     admin = LocalIdentity()
     _cli(_room_acl(db, key))._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
 
-    label = acl_identity_label("room-a", "room_server")
-    assert db.delete_acl_identity(key.get_public_key().hex(), label) == 1
-    # A room created later under the same name does not inherit the admins.
-    assert _room_acl(db, LocalIdentity()).load() == 0
+    assert db.delete_acl_identity(key.get_public_key().hex()) == 1
+    assert _room_acl(db, key).load() == 0
+
+
+def test_a_room_setperm_read_write_entry_is_not_stored(db):
+    # Firmware's room server saves admins only.
+    local = LocalIdentity()
+    writer = LocalIdentity()
+    acl = _room_acl(db, local)
+    assert _cli(acl)._cmd_setperm(f"setperm {writer.get_public_key().hex()} 2") == "OK"
+    assert acl.get_client(writer.get_public_key()) is not None
+    assert acl.is_persisted(writer.get_public_key()) is False
+    assert _room_acl(db, local).load() == 0
+
+
+# ---------------------------------------------------------------------------
+# Store failures
+# ---------------------------------------------------------------------------
+
+
+class _FailingStore:
+    """A store whose writes fail, with a working read."""
+
+    def __init__(self, rows=()):
+        self.rows = list(rows)
+
+    def load_acl_entries(self, identity_pubkey, adopt_label=None):
+        return list(self.rows)
+
+    def upsert_acl_entry(self, *args):
+        raise RuntimeError("disk full")
+
+    def delete_acl_entry(self, *args):
+        raise RuntimeError("disk full")
+
+
+def test_setperm_reports_a_failed_write_and_leaves_the_table_unchanged():
+    acl = ACL(store=_FailingStore(), local_identity=LocalIdentity(), identity_label="repeater")
+    admin = LocalIdentity()
+
+    reply = _cli(acl)._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+    assert reply == "Err - failed to save"
+    assert acl.get_num_clients() == 0
+
+
+def test_a_failed_delete_keeps_the_entry(db):
+    local = LocalIdentity()
+    admin = LocalIdentity()
+    acl = _repeater_acl(db, local)
+    _cli(acl)._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+    acl._store = _FailingStore()
+
+    assert _cli(acl)._cmd_setperm(f"setperm {admin.get_public_key().hex()} 0") == (
+        "Err - failed to save"
+    )
+    with pytest.raises(ACLStoreError):
+        acl.remove_client(admin.get_public_key())
+    assert acl.get_client(admin.get_public_key()) is not None
+
+
+def test_a_failed_write_does_not_fail_a_password_login():
+    acl = ACL(
+        admin_password="adminpw",
+        store=_FailingStore(),
+        local_identity=LocalIdentity(),
+        identity_label="repeater",
+    )
+    assert _login(acl, LocalIdentity(), "adminpw", 1) == (True, PERM_ACL_ADMIN)
+
+
+def test_concurrent_grant_and_removal_leave_memory_and_store_in_agreement(db):
+    # A removal racing a grant must not leave the grant stored but not listed.
+    local = LocalIdentity()
+    keys = [LocalIdentity().get_public_key() for _ in range(8)]
+    acl = _repeater_acl(db, local, max_clients=64)
+
+    def churn(key):
+        for _ in range(20):
+            acl.apply_permissions(key, PERM_ACL_ADMIN)
+            acl.remove_client(key)
+            acl.apply_permissions(key, PERM_ACL_ADMIN)
+
+    threads = [threading.Thread(target=churn, args=(k,)) for k in keys for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    stored = {bytes.fromhex(r["client_pubkey"]) for r in _acl_rows(db)}
+    assert stored == set(acl.clients)
+
+
+def test_stored_entries_past_max_clients_all_load():
+    # Lowering max_clients must not revoke grants that are already stored.
+    rows = [
+        {"client_pubkey": LocalIdentity().get_public_key().hex(), "permissions": 3}
+        for _ in range(4)
+    ]
+    acl = ACL(max_clients=2, store=_FailingStore(rows), local_identity=LocalIdentity())
+    assert acl.load() == 4
+    # Full of admins: newcomers are refused rather than evicting one.
+    assert _login(acl, LocalIdentity(), "", 1) == (False, 0)
 
 
 def test_a_failed_store_read_leaves_an_empty_acl():
@@ -417,6 +558,44 @@ def test_login_helper_loads_the_stored_acl_at_registration(db):
     second.register_identity("repeater", local, identity_type="repeater", config=config)
     reloaded = second.get_acl_for_identity(local.get_public_key()[0])
     assert _login(reloaded, admin, "", 5) == (True, PERM_ACL_ADMIN)
+
+
+def test_re_registering_an_identity_keeps_its_live_sessions(db):
+    # A hot reload (a rename, say) must not zero live sessions: the room sync
+    # loop skips clients with no activity, and the replay watermark would reset.
+    local = LocalIdentity()
+    admin = LocalIdentity()
+    helper = _login_helper(db)
+    helper.register_identity("room-a", local, identity_type="room_server", config=ROOM_CFG)
+    acl = helper.get_acl_by_name("room-a")
+    _login(acl, admin, "roomadmin", 10, ROOM_CFG)
+
+    helper.register_identity("room-b", local, identity_type="room_server", config=ROOM_CFG)
+
+    assert helper.get_acl_by_name("room-b") is acl
+    assert helper.get_acl_by_name("room-a") is None
+    client = acl.get_client(admin.get_public_key())
+    assert client.last_activity != 0
+    assert _login(acl, admin, "", 10) == (False, 0)  # still a replay
+
+
+def test_a_rekeyed_identity_gets_a_fresh_acl_on_its_new_key(db):
+    old_key, new_key = LocalIdentity(), LocalIdentity()
+    while new_key.get_public_key()[0] != old_key.get_public_key()[0]:
+        new_key = LocalIdentity()
+    admin = LocalIdentity()
+    helper = _login_helper(db)
+    helper.register_identity("room-a", old_key, identity_type="room_server", config=ROOM_CFG)
+    _cli(helper.get_acl_by_name("room-a"))._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+    helper.move_room_acl(old_key.get_public_key().hex(), new_key.get_public_key().hex(), "room-a")
+
+    # Same hash byte, different key: not reused, so secrets use the new key.
+    helper.register_identity("room-a", new_key, identity_type="room_server", config=ROOM_CFG)
+    acl = helper.get_acl_by_name("room-a")
+    assert acl.identity_pubkey_hex == new_key.get_public_key().hex()
+    assert acl.get_client(admin.get_public_key()).shared_secret == Identity(
+        admin.get_public_key()
+    ).calc_shared_secret(new_key.get_private_key())
 
 
 def test_login_helper_room_acl_keeps_admins_only(db):

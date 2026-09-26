@@ -121,8 +121,10 @@ repeater:
 
   # Security settings for login/authentication (shared across all identities)
   security:
-    # Maximum number of authenticated clients (across all identities)
-    max_clients: 5
+    # Maximum ACL entries for the repeater (firmware MAX_CLIENTS is 32).
+    # Admins are never evicted and are kept across restarts, so a small
+    # table fills up with them.
+    max_clients: 32
 
     # Admin password for full access
     admin_password: "admin123"
