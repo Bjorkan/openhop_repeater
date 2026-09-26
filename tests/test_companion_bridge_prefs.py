@@ -87,8 +87,8 @@ def test_bridge_accepts_host_radio_callbacks(identity):
 
 
 def test_companion_ver_names_the_repeater_and_core_versions():
-    """The virtual companion's CLI `ver` (CMD_RUN_CLI_COMMAND / remote CLI)
-    reports the openHop software running it, repeater first."""
+    """The bridge registers the repeater with the core's companion CLI, so its
+    `ver` names both, repeater first. Skipped against a core without the CLI."""
     import openhop_core
     from openhop_core.protocol import LocalIdentity
 
