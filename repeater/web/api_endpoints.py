@@ -6870,8 +6870,15 @@ class APIEndpoints:
             registration_success = False
             # Only reload if identity_key was actually provided and not empty, or if name changed
             needs_reload = data.get("identity_key") or "new_name" in data
+            # A room with no password is not registered for logins, so a live
+            # reload would leave its login ACL under the old name; it waits
+            # for a restart instead.
+            room_settings = identity.get("settings") or {}
+            can_log_in = bool(
+                room_settings.get("admin_password") or room_settings.get("guest_password")
+            )
 
-            if needs_reload and self.daemon_instance:
+            if needs_reload and can_log_in and self.daemon_instance:
                 try:
                     from openhop_core import LocalIdentity
 
@@ -6913,16 +6920,20 @@ class APIEndpoints:
                             and hasattr(identity_manager, "unregister_identity")
                             else None
                         )
-                        registration_success = self.daemon_instance._register_identity_everywhere(
-                            name=final_name,
-                            identity=room_identity,
-                            config=identity,
-                            identity_type="room_server",
-                        )
-                        if not registration_success and previous is not None:
-                            identity_manager.register_identity(
-                                old_name, previous[0], previous[1], previous[2]
+                        try:
+                            registration_success = (
+                                self.daemon_instance._register_identity_everywhere(
+                                    name=final_name,
+                                    identity=room_identity,
+                                    config=identity,
+                                    identity_type="room_server",
+                                )
                             )
+                        finally:
+                            if not registration_success and previous is not None:
+                                identity_manager.register_identity(
+                                    old_name, previous[0], previous[1], previous[2]
+                                )
                         if registration_success:
                             logger.info(
                                 f"Hot reload: Re-registered identity '{final_name}' with all systems"
@@ -7066,16 +7077,11 @@ class APIEndpoints:
                     if hasattr(self.daemon_instance, "identity_manager"):
                         identity_manager = self.daemon_instance.identity_manager
 
-                        # Remove from named_identities dict
-                        if name_s in identity_manager.named_identities:
-                            del identity_manager.named_identities[name_s]
-                            logger.info(f"Removed identity {name_s} from named_identities")
+                        # Release its name and hash slot, so a room re-created with
+                        # this name or key registers live rather than after a restart.
+                        if identity_manager.unregister_identity(name_s) is not None:
+                            logger.info(f"Unregistered identity {name_s}")
                             unregister_success = True
-
-                        # Note: We don't remove from identities dict (keyed by hash)
-                        # because we'd need to look up the hash first, and there could
-                        # be multiple identities with the same hash
-                        # Full cleanup happens on restart
 
                 except Exception as unreg_error:
                     logger.error(
@@ -7336,6 +7342,8 @@ class APIEndpoints:
         login_helper = getattr(daemon, "login_helper", None)
         if login_helper is None:
             return []
+        # LoginHelper.get_acl_by_name is required: the hash lookup it replaced
+        # attributes one identity's ACL to another that shares its hash byte.
 
         owners = []
         if getattr(daemon, "local_identity", None):
