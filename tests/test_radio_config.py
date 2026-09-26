@@ -365,3 +365,36 @@ def test_a_radios_entry_inheriting_a_stray_top_level_sync_word_is_named(monkeypa
     assert captured["sync_word"] == 0x3444
     assert "Radio 'narrow' (modem_tcp) sync_word is 0x3444" in caplog.text
     assert "inherit the top-level radio.sync_word" in caplog.text
+
+
+def test_a_radios_entry_overriding_the_stray_sync_word_is_not_warned_about(monkeypatch, caplog):
+    """The fix for the inherited case: the entry sets 0x12 itself."""
+    from repeater.config import _merge_radio_entry
+
+    captured = _capture_modem(monkeypatch, "modem_tcp")
+    global_config = {"radio_type": "sx1262", "radio": {**_modem_radio_cfg(), "sync_word": 13380}}
+    entry = {
+        "id": "narrow",
+        "radio_type": "modem_tcp",
+        "radio": {"frequency": 910525000, "sync_word": 0x12},
+        "modem_tcp": {"host": "192.168.50.154"},
+    }
+
+    with caplog.at_level("WARNING", logger="Config"):
+        get_radio_for_board(_merge_radio_entry(global_config, entry))
+
+    assert captured["sync_word"] == 0x12
+    assert "sync_word" not in caplog.text
+
+
+@pytest.mark.parametrize("radio_type", ["modem_tcp", "modem_usb"])
+def test_an_explicit_null_sync_word_means_the_default(monkeypatch, caplog, radio_type):
+    """`sync_word:` left empty in YAML loads as None."""
+    captured = _capture_modem(monkeypatch, radio_type)
+    radio = {**_modem_radio_cfg(), "sync_word": None}
+
+    with caplog.at_level("WARNING", logger="Config"):
+        get_radio_for_board(_modem_board(radio_type, radio))
+
+    assert captured["sync_word"] == 0x12
+    assert "sync_word" not in caplog.text
