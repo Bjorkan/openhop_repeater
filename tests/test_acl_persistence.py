@@ -251,6 +251,269 @@ def test_a_returning_admin_login_does_not_rewrite_its_entry(db):
     db.upsert_acl_entry.assert_not_called()
 
 
+def test_a_stored_entrys_last_login_survives_a_restart(db):
+    local = LocalIdentity()
+    admin, guest = LocalIdentity(), LocalIdentity()
+    acl = _repeater_acl(db, local)
+    _cli(acl)._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+
+    reloaded = _repeater_acl(db, local)
+    reloaded.load()
+    # Provisioned but never logged in.
+    assert reloaded.get_client(admin.get_public_key()).last_login_success == 0
+
+    assert _login(reloaded, admin, "", 5) == (True, PERM_ACL_ADMIN)
+    logged_in_at = reloaded.get_client(admin.get_public_key()).last_login_success
+    assert logged_in_at > 0
+    # A guest is not stored, so its login writes nothing.
+    _login(reloaded, guest, "guestpw", 5)
+    assert len(_acl_rows(db)) == 1
+
+    restarted = _repeater_acl(db, local)
+    restarted.load()
+    loaded = restarted.get_client(admin.get_public_key())
+    assert loaded.last_login_success == logged_in_at
+    # Still not active until it logs in again.
+    assert loaded.last_activity == 0
+
+
+def test_a_password_login_that_creates_the_entry_stores_its_login_time(db):
+    local = LocalIdentity()
+    admin = LocalIdentity()
+    _login(_repeater_acl(db, local), admin, "adminpw", 1)
+
+    (row,) = _acl_rows(db)
+    assert row["last_login"] and row["last_login"] > 0
+
+
+def test_a_rekeyed_identity_keeps_its_entries_last_login(db):
+    old_key, new_key = LocalIdentity(), LocalIdentity()
+    admin = LocalIdentity()
+    helper = _login_helper(db)
+    helper.register_identity("room", old_key, identity_type="room_server", config=ROOM_CFG)
+    live = helper.get_acl_by_name("room")
+    _login(live, admin, "roomadmin", 1, config=ROOM_CFG)
+    logged_in_at = live.get_client(admin.get_public_key()).last_login_success
+
+    helper.move_room_acl(
+        "room", old_key.get_public_key().hex(), new_key.get_public_key().hex(), "room"
+    )
+
+    restarted = _room_acl(db, new_key, "room")
+    restarted.load()
+    assert restarted.get_client(admin.get_public_key()).last_login_success == logged_in_at
+
+
+def test_a_failed_login_time_write_does_not_fail_the_login(db):
+    local = LocalIdentity()
+    admin = LocalIdentity()
+    acl = _repeater_acl(db, local)
+    _login(acl, admin, "adminpw", 1)
+
+    db.touch_acl_login = MagicMock(side_effect=RuntimeError("disk gone"))
+    assert _login(acl, admin, "", 2) == (True, PERM_ACL_ADMIN)
+    assert _login(acl, admin, "adminpw", 3) == (True, PERM_ACL_ADMIN)
+
+
+def test_a_guest_promoted_by_setperm_keeps_its_login_time(db):
+    local = LocalIdentity()
+    guest = LocalIdentity()
+    acl = _repeater_acl(db, local)
+    _login(acl, guest, "guestpw", 1)
+    logged_in_at = acl.get_client(guest.get_public_key()).last_login_success
+
+    _cli(acl)._cmd_setperm(f"setperm {guest.get_public_key().hex()} 3")
+
+    restarted = _repeater_acl(db, local)
+    restarted.load()
+    assert restarted.get_client(guest.get_public_key()).last_login_success == logged_in_at
+
+
+def test_a_permission_change_keeps_the_stored_login_time(db):
+    local = LocalIdentity()
+    admin = LocalIdentity()
+    acl = _repeater_acl(db, local)
+    _cli(acl)._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+    db.touch_acl_login(local.get_public_key().hex(), admin.get_public_key().hex(), 42.0)
+
+    restarted = _repeater_acl(db, local)
+    restarted.load()
+    _cli(restarted)._cmd_setperm(f"setperm {admin.get_public_key().hex()} 7")
+
+    assert _acl_rows(db)[0]["last_login"] == 42.0
+
+
+def test_an_entry_taken_over_from_another_label_does_not_inherit_its_login_time(db):
+    # A deleted room whose cleanup failed leaves a row; a new room on the same
+    # key granting the same client must not show the old room's login.
+    local = LocalIdentity()
+    admin = LocalIdentity()
+    db.upsert_acl_entry(
+        local.get_public_key().hex(),
+        "room_server:old",
+        admin.get_public_key().hex(),
+        PERM_ACL_ADMIN,
+        last_login=42.0,
+    )
+
+    room = _room_acl(db, local, "new")
+    room.load()
+    _cli(room)._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+
+    (row,) = _acl_rows(db)
+    assert row["identity_label"] == "room_server:new"
+    assert row["last_login"] is None
+    restarted = _room_acl(db, local, "new")
+    restarted.load()
+    assert restarted.get_client(admin.get_public_key()).last_login_success == 0
+
+
+def test_a_login_in_the_same_second_as_the_stored_one_does_not_write(db, monkeypatch):
+    local = LocalIdentity()
+    admin = LocalIdentity()
+    acl = _repeater_acl(db, local)
+    monkeypatch.setattr(time, "time", lambda: 1000.0)
+    _login(acl, admin, "adminpw", 1)
+
+    db.touch_acl_login = MagicMock(wraps=db.touch_acl_login)
+    db.upsert_acl_entry = MagicMock(wraps=db.upsert_acl_entry)
+    _login(acl, admin, "", 2)
+    _login(acl, admin, "adminpw", 3)
+    db.touch_acl_login.assert_not_called()
+    db.upsert_acl_entry.assert_not_called()
+
+    monkeypatch.setattr(time, "time", lambda: 1001.0)
+    _login(acl, admin, "", 4)
+    db.touch_acl_login.assert_called_once()
+
+
+def test_a_failed_login_time_write_is_retried_by_the_next_login(db, monkeypatch):
+    local = LocalIdentity()
+    admin = LocalIdentity()
+    acl = _repeater_acl(db, local)
+    monkeypatch.setattr(time, "time", lambda: 1000.0)
+    _login(acl, admin, "adminpw", 1)
+
+    monkeypatch.setattr(time, "time", lambda: 1001.0)
+    real_touch = db.touch_acl_login
+    db.touch_acl_login = MagicMock(side_effect=RuntimeError("database is locked"))
+    _login(acl, admin, "", 2)
+    db.touch_acl_login = real_touch
+    _login(acl, admin, "", 3)
+
+    assert _acl_rows(db)[0]["last_login"] == 1001.0
+
+
+def test_a_login_during_a_failed_load_is_stored_once_the_load_recovers(db, monkeypatch):
+    local = LocalIdentity()
+    admin = LocalIdentity()
+    monkeypatch.setattr(time, "time", lambda: 1000.0)
+    _login(_repeater_acl(db, local), admin, "adminpw", 1)
+
+    acl = _repeater_acl(db, local)
+    real_load = db.load_acl_entries
+    db.load_acl_entries = MagicMock(side_effect=RuntimeError("database is locked"))
+    acl.load()
+    monkeypatch.setattr(time, "time", lambda: 2000.0)
+    # The guest password: the stored admin grant is unknown until the load works.
+    assert _login(acl, admin, "guestpw", 2) == (True, PERM_ACL_GUEST)
+
+    db.load_acl_entries = real_load
+    acl.load()
+
+    restarted = _repeater_acl(db, local)
+    restarted.load()
+    assert restarted.get_client(admin.get_public_key()).last_login_success == 2000
+
+
+def test_a_recovered_load_does_not_erase_the_login_time_of_an_entry_granted_meanwhile(db):
+    local = LocalIdentity()
+    admin, other = LocalIdentity(), LocalIdentity()
+    _cli(_repeater_acl(db, local))._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+    db.touch_acl_login(local.get_public_key().hex(), admin.get_public_key().hex(), 5000.0)
+
+    acl = _repeater_acl(db, local)
+    real_load = db.load_acl_entries
+    db.load_acl_entries = MagicMock(side_effect=RuntimeError("database is locked"))
+    acl.load()
+    # A setperm while the stored ACL is unreadable: a live entry that never logged in.
+    assert acl.apply_permissions(admin.get_public_key(), PERM_ACL_ADMIN)
+    assert acl.get_client(admin.get_public_key()).last_login_success == 0
+
+    db.load_acl_entries = real_load
+    # Any later change retries the load.
+    assert acl.apply_permissions(other.get_public_key(), PERM_ACL_ADMIN)
+
+    assert acl.get_client(admin.get_public_key()).last_login_success == 5000
+    restarted = _repeater_acl(db, local)
+    restarted.load()
+    assert restarted.get_client(admin.get_public_key()).last_login_success == 5000
+
+
+def test_a_renamed_room_keeps_its_entries_last_login(db):
+    key = LocalIdentity()
+    admin = LocalIdentity()
+    helper = _login_helper(db)
+    helper.register_identity("old", key, identity_type="room_server", config=ROOM_CFG)
+    live = helper.get_acl_by_name("old")
+    _login(live, admin, "roomadmin", 1, config=ROOM_CFG)
+    logged_in_at = live.get_client(admin.get_public_key()).last_login_success
+
+    helper.move_room_acl("old", key.get_public_key().hex(), key.get_public_key().hex(), "new")
+
+    restarted = _room_acl(db, key, "new")
+    restarted.load()
+    assert restarted.get_client(admin.get_public_key()).last_login_success == logged_in_at
+
+
+def test_a_rekeyed_repeater_adopts_its_entries_last_login(db):
+    old_key, new_key = LocalIdentity(), LocalIdentity()
+    admin = LocalIdentity()
+    before = _repeater_acl(db, old_key)
+    _login(before, admin, "adminpw", 1)
+    logged_in_at = before.get_client(admin.get_public_key()).last_login_success
+
+    rotated = _repeater_acl(db, new_key)
+    rotated.load()
+    assert rotated.get_client(admin.get_public_key()).last_login_success == logged_in_at
+
+
+def test_loading_an_acl_writes_nothing(db):
+    local = LocalIdentity()
+    admin = LocalIdentity()
+    _login(_repeater_acl(db, local), admin, "adminpw", 1)
+
+    db.touch_acl_login = MagicMock(wraps=db.touch_acl_login)
+    db.upsert_acl_entry = MagicMock(wraps=db.upsert_acl_entry)
+    acl = _repeater_acl(db, local)
+    acl.load()
+    acl.load()
+    db.touch_acl_login.assert_not_called()
+    db.upsert_acl_entry.assert_not_called()
+
+
+def test_an_acl_table_from_before_last_login_is_migrated(tmp_path):
+    db = SQLiteHandler(tmp_path)
+    admin = LocalIdentity().get_public_key().hex()
+    with db._connect() as conn:
+        conn.execute("DROP TABLE acl_entries")
+        conn.execute(
+            "CREATE TABLE acl_entries (identity_pubkey TEXT NOT NULL, identity_label TEXT NOT NULL, "
+            "client_pubkey TEXT NOT NULL, permissions INTEGER NOT NULL, updated_at REAL NOT NULL, "
+            "PRIMARY KEY (identity_pubkey, client_pubkey))"
+        )
+        conn.execute(
+            "INSERT INTO acl_entries VALUES ('aa', 'repeater', ?, 3, 0)",
+            (admin,),
+        )
+
+    migrated = SQLiteHandler(tmp_path)
+    (row,) = migrated.load_acl_entries("aa", identity_label="repeater")
+    assert row["last_login"] is None
+    migrated.touch_acl_login("aa", admin, 42.0)
+    assert migrated.load_acl_entries("aa", identity_label="repeater")[0]["last_login"] == 42.0
+
+
 def test_room_server_persists_admins_only(db):
     local = LocalIdentity()
     admin, writer = LocalIdentity(), LocalIdentity()
@@ -454,7 +717,7 @@ class _FailingStore:
     def load_acl_entries(self, identity_pubkey, identity_label=None, adopt_label=None):
         return list(self.rows)
 
-    def upsert_acl_entry(self, *args):
+    def upsert_acl_entry(self, *args, **kwargs):
         raise RuntimeError("disk full")
 
     def delete_acl_entry(self, *args):

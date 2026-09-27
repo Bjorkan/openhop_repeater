@@ -198,8 +198,9 @@ class ACL:
     With a ``store`` the entries firmware writes to ``/s_contacts`` survive a
     restart: every entry with non-zero permissions that ``persist_filter``
     accepts. The repeater passes no filter; a room server keeps admins only,
-    as firmware's ``saveFilter``. Writes happen when an entry's stored
-    permissions change, not on every login, so a returning admin costs no I/O.
+    as firmware's ``saveFilter``. Permissions are written when they change;
+    a login by a stored entry writes only its login time, one small update,
+    so the web UI shows when each admin last logged in across a restart.
 
     The table is changed from the event loop (logins) and from web request
     threads (setperm, removal), so each change and its write happen under one
@@ -239,6 +240,9 @@ class ACL:
         )
         # Permissions as last written to the store, keyed like ``clients``.
         self._persisted: Dict[bytes, int] = {}
+        # Login times as last written to the store, so a login in the same
+        # second as the stored one costs no write.
+        self._persisted_login: Dict[bytes, int] = {}
         # Set when load() could not read the store: the table is then not the
         # stored one, and the web API says so rather than showing it as empty.
         self.load_error: Optional[str] = None
@@ -266,7 +270,9 @@ class ACL:
 
         Loaded entries have ``last_activity`` 0, as in firmware: known, not
         active, until the client logs in again. The replay watermark also
-        starts at 0, as firmware keeps it in RAM only.
+        starts at 0, as firmware keeps it in RAM only. ``last_login_success``
+        is restored from the store; firmware does not keep it, but it tells
+        an operator whether a grant is still in use.
 
         Every stored entry is loaded even past ``max_clients``: lowering the
         limit must not silently revoke provisioned grants. An over-full table
@@ -301,6 +307,7 @@ class ACL:
             try:
                 pub_key = bytes.fromhex(row["client_pubkey"])
                 permissions = int(row["permissions"]) & 0xFF
+                last_login = int(row.get("last_login") or 0)
                 if len(pub_key) != PUB_KEY_SIZE or permissions == 0:
                     continue
                 identity = Identity(pub_key)
@@ -308,15 +315,23 @@ class ACL:
                 logger.warning(f"Skipping malformed ACL row for '{self._identity_label}': {row}")
                 continue
             self._persisted[pub_key] = permissions
+            self._persisted_login[pub_key] = last_login
             live = self.clients.get(pub_key)
             if live is not None:
                 # Joined while the store could not be read (a retried load).
                 # Keep the session; a guest session takes its stored grant.
                 if live.permissions == 0:
                     live.permissions = permissions
+                # The later login wins: one made while the entry was not known
+                # to be stored went unrecorded, and is written now rather than
+                # at its next login; an entry that has not logged in since
+                # (setperm during the outage) shows the stored time.
+                live.last_login_success = max(live.last_login_success, last_login)
+                self._record_login(pub_key, live)
             else:
                 client = ClientInfo(identity, permissions)
                 client.shared_secret = self._derive_secret(pub_key)
+                client.last_login_success = last_login
                 self.clients[pub_key] = client
             loaded += 1
 
@@ -387,6 +402,7 @@ class ACL:
         with self._lock:
             self._store = None
             self._persisted.clear()
+            self._persisted_login.clear()
             self.load_error = None
             self._detached = True
 
@@ -423,12 +439,19 @@ class ACL:
         wanted = client.permissions if client is not None and self._should_persist(client) else None
         if self._persisted.get(pub_key) == wanted:
             return
+        # A client that logged in before it was stored (a guest promoted by
+        # setperm) keeps its login time; None leaves a stored one alone.
+        last_login = (client.last_login_success or None) if client is not None else None
         try:
             if wanted is None:
                 self._store.delete_acl_entry(self._store_key, pub_key.hex())
             else:
                 self._store.upsert_acl_entry(
-                    self._store_key, self._identity_label, pub_key.hex(), wanted
+                    self._store_key,
+                    self._identity_label,
+                    pub_key.hex(),
+                    wanted,
+                    last_login=last_login,
                 )
         except Exception as e:
             logger.error(
@@ -437,8 +460,33 @@ class ACL:
             raise ACLStoreError(str(e)) from e
         if wanted is None:
             self._persisted.pop(pub_key, None)
+            self._persisted_login.pop(pub_key, None)
         else:
             self._persisted[pub_key] = wanted
+            if last_login is not None:
+                self._persisted_login[pub_key] = last_login
+
+    def _record_login(self, pub_key: bytes, client: "ClientInfo") -> None:
+        """Store a stored entry's login time. Call under the lock, after ``_sync_entry``.
+
+        Best-effort: the time is decoration, and a failed write must not fail
+        the login it records.
+        """
+        if not self._persistence_enabled() or pub_key not in self._persisted:
+            return
+        if not client.last_login_success:
+            return
+        if self._persisted_login.get(pub_key) == client.last_login_success:
+            return
+        try:
+            self._store.touch_acl_login(self._store_key, pub_key.hex(), client.last_login_success)
+        except Exception as e:
+            logger.warning(
+                f"Could not save the login time of {pub_key[:6].hex()}... "
+                f"for '{self._identity_label}': {e}"
+            )
+            return
+        self._persisted_login[pub_key] = client.last_login_success
 
     def is_persisted(self, pub_key: bytes) -> bool:
         """Whether this entry is in the store, so it survives a restart."""
@@ -675,6 +723,7 @@ class ACL:
             if self._is_replay(client, timestamp):
                 return False, 0
             self._touch_client_session(client, shared_secret, timestamp, sync_since=sync_since)
+            self._record_login(bytes(pub_key), client)
             # No role normalisation needed: PERM_ACL_GUEST *is* role 0, so a
             # client stored with no role bits already reads back as a guest.
             return True, client.permissions
@@ -720,6 +769,7 @@ class ACL:
             self._sync_entry(pub_key)
         except ACLStoreError:
             pass
+        self._record_login(bytes(pub_key), client)
 
         logger.info(f"Login success! Role: {client.role_name()}")
         return True, client.permissions
