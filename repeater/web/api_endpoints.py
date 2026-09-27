@@ -7390,6 +7390,14 @@ class APIEndpoints:
             "stored_entries": sum(1 for c in clients if acl.is_persisted(c.id.get_public_key())),
         }
 
+    def _node_names(self, pubkeys) -> dict:
+        """Names for public keys from the store; empty when there is none."""
+        storage = getattr(getattr(self.daemon_instance, "repeater_handler", None), "storage", None)
+        sqlite_handler = getattr(storage, "sqlite_handler", None)
+        if sqlite_handler is None or not hasattr(sqlite_handler, "lookup_node_names"):
+            return {}
+        return sqlite_handler.lookup_node_names(list(pubkeys))
+
     def _acl_owners(self) -> list:
         """(name, type, identity, acl) for each identity with an ACL.
 
@@ -7560,6 +7568,11 @@ class APIEndpoints:
             # Identities whose stored ACL could not be read: their list is not
             # the stored one, and must not pass for an empty one.
             store_errors = {}
+            names = self._node_names(
+                client.id.get_public_key().hex()
+                for _n, _t, _i, acl in owners
+                for client in acl.get_all_clients()
+            )
             for name, identity_type, identity, acl in owners:
                 identity_pubkey = identity.get_public_key()
                 if identity_name and name != identity_name:
@@ -7577,6 +7590,10 @@ class APIEndpoints:
                             {
                                 "public_key": pub_key[:8].hex() + "..." + pub_key[-4:].hex(),
                                 "public_key_full": pub_key.hex(),
+                                # The name the node advertises, when the repeater
+                                # or one of its companions has heard it.
+                                "client_name": names.get(pub_key.hex(), {}).get("name"),
+                                "client_type": names.get(pub_key.hex(), {}).get("contact_type"),
                                 # Compute address from public key (first byte of SHA256)
                                 "address": CryptoUtils.sha256(pub_key)[:1].hex(),
                                 # Accurate role name: with the guest password
