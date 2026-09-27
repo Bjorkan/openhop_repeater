@@ -6,7 +6,9 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from openhop_core.companion.constants import AUTOADD_OVERWRITE_OLDEST
 from openhop_core.companion.models import Contact
+from openhop_core.node.events import MeshEvents
 from openhop_core.protocol import LocalIdentity
 from repeater.companion.bridge import RepeaterCompanionBridge
 from repeater.companion.frame_server import CompanionFrameServer
@@ -127,6 +129,28 @@ async def test_import_persist_restart_and_export_are_byte_exact(tmp_path):
     restarted.contacts.load_from_dicts(records)
 
     assert restarted.export_contact(MESHCORE_ADVERT_PUBKEY) == MESHCORE_ADVERT_WIRE
+
+
+@pytest.mark.asyncio
+async def test_overwritten_contact_is_deleted_from_storage(tmp_path):
+    handler = SQLiteHandler(tmp_path)
+    bridge = RepeaterCompanionBridge(
+        LocalIdentity(),
+        AsyncMock(return_value=True),
+        max_contacts=1,
+        sqlite_handler=handler,
+        companion_hash=COMPANION_HASH,
+    )
+    bridge.prefs.autoadd_config = AUTOADD_OVERWRITE_OLDEST
+    server = CompanionFrameServer(bridge, COMPANION_HASH, port=0, sqlite_handler=handler)
+    server._setup_push_callbacks()
+
+    for key, name in ((b"\x01" * 32, "old"), (b"\x02" * 32, "new")):
+        advert = {"public_key": key, "name": name, "contact_type": 1}
+        await bridge._handle_mesh_event(MeshEvents.NODE_DISCOVERED, advert)
+
+    rows = handler.companion_load_contacts(COMPANION_HASH)
+    assert [row["name"] for row in rows] == ["new"]
 
 
 def test_migration_adds_nullable_advert_blob_without_losing_existing_contacts(tmp_path):
