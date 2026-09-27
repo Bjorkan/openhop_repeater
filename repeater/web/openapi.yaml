@@ -6855,6 +6855,18 @@ components:
           pattern: '^0x[0-9a-fA-F]{2}$'
           description: Hash of the identity
           example: "0xC5"
+        client_name:
+          type: string
+          nullable: true
+          description: |
+            The client's advertised name, from an advert the repeater heard or
+            else a companion's contact for it; null when neither knows it.
+          example: "Howl"
+        client_type:
+          type: string
+          nullable: true
+          description: Contact type from the client's advert (e.g. "Chat Node"), when heard
+          example: "Chat Node"
         identity_pubkey:
           type: string
           pattern: '^[0-9a-fA-F]{64}$'

@@ -675,3 +675,32 @@ def test_creating_a_room_is_refused_when_leftovers_under_its_name_cannot_be_clea
     result = api.create_identity()
     assert result["success"] is False
     assert [r["name"] for r in daemon.config["identities"]["room_servers"]] == ["room-a"]
+
+
+def test_acl_clients_names_a_client_from_its_advert_or_a_companion_contact(db, request_ctx):
+    daemon = _Daemon(db, [])
+    heard, via_companion, unknown = (LocalIdentity().get_public_key() for _ in range(3))
+    acl = daemon.login_helper.get_acl_by_name("repeater")
+    for key in (heard, via_companion, unknown):
+        acl.apply_permissions(key, 3)
+    now = 1_790_000_000
+    with db._connect() as conn:
+        conn.execute(
+            "INSERT INTO adverts (timestamp, pubkey, node_name, is_repeater, contact_type, "
+            "first_seen, last_seen, is_new_neighbor) VALUES (?, ?, ?, 0, 'Chat Node', ?, ?, 0)",
+            (now, heard.hex(), "Heard Node", now, now),
+        )
+        conn.execute(
+            "INSERT INTO companion_contacts (companion_hash, pubkey, name, updated_at) "
+            "VALUES ('0xab', ?, 'Contact Name', ?)",
+            (via_companion, now),
+        )
+    api = _api(daemon)
+
+    clients = {c["public_key_full"]: c for c in api.acl_clients()["data"]["clients"]}
+    assert (clients[heard.hex()]["client_name"], clients[heard.hex()]["client_type"]) == (
+        "Heard Node",
+        "Chat Node",
+    )
+    assert clients[via_companion.hex()]["client_name"] == "Contact Name"
+    assert clients[unknown.hex()]["client_name"] is None

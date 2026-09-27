@@ -4829,6 +4829,41 @@ class SQLiteHandler:
             logger.error(f"Failed to cleanup old messages: {e}")
             return 0
 
+    def lookup_node_names(self, pubkeys: List[str]) -> Dict[str, Dict[str, Optional[str]]]:
+        """Names for full public keys, from adverts heard or companions' contacts.
+
+        Returns ``{pubkey_hex: {"name": ..., "contact_type": ...}}`` for the
+        keys found. An advert the repeater heard wins; a companion's contact
+        (the name another node gave it) is the fallback, for a node never
+        heard directly. Never raises: names are decoration.
+        """
+        keys = sorted({str(k).lower() for k in pubkeys if k})
+        if not keys:
+            return {}
+        found: Dict[str, Dict[str, Optional[str]]] = {}
+        try:
+            with self._connect() as conn:
+                marks = ",".join("?" * len(keys))
+                for pubkey, name, contact_type in conn.execute(
+                    f"SELECT pubkey, node_name, contact_type FROM adverts "
+                    f"WHERE pubkey IN ({marks}) AND node_name IS NOT NULL AND node_name != ''",
+                    keys,
+                ):
+                    found[pubkey.lower()] = {"name": name, "contact_type": contact_type}
+                missing = [k for k in keys if k not in found]
+                if missing:
+                    marks = ",".join("?" * len(missing))
+                    for pubkey, name in conn.execute(
+                        f"SELECT lower(hex(pubkey)), name FROM companion_contacts "
+                        f"WHERE lower(hex(pubkey)) IN ({marks}) AND name != '' "
+                        f"ORDER BY lastmod DESC",
+                        missing,
+                    ):
+                        found.setdefault(pubkey, {"name": name, "contact_type": None})
+        except Exception as e:
+            logger.debug(f"Could not look up node names: {e}")
+        return found
+
     # ACL persistence methods
     #
     # Unlike the other helpers here, these raise on a database error: a caller
