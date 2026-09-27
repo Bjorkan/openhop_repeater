@@ -1016,7 +1016,9 @@ class SQLiteHandler:
                 # repeater, which is unique, adopts its rows by label after a
                 # key change, as firmware's ACL survives a new private key.
                 # Shared secrets are derived on load, not stored, so a key
-                # change cannot leave stale ones on disk.
+                # change cannot leave stale ones on disk. last_login is the
+                # time of the entry's last successful login, NULL until one;
+                # firmware keeps it in RAM only, we keep it for the web UI.
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS acl_entries (
@@ -1025,6 +1027,7 @@ class SQLiteHandler:
                         client_pubkey TEXT NOT NULL,
                         permissions INTEGER NOT NULL,
                         updated_at REAL NOT NULL,
+                        last_login REAL,
                         PRIMARY KEY (identity_pubkey, client_pubkey)
                     )
                 """
@@ -1032,6 +1035,13 @@ class SQLiteHandler:
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_acl_entries_label ON acl_entries(identity_label)"
                 )
+                # Added to a table created before last_login, here rather than
+                # in the migrations: the ACL load reads it, and a failed
+                # earlier migration must not stop stored admins logging in.
+                columns = [c[1] for c in conn.execute("PRAGMA table_info(acl_entries)")]
+                if "last_login" not in columns:
+                    conn.execute("ALTER TABLE acl_entries ADD COLUMN last_login REAL")
+                    logger.info("Added last_login column to acl_entries table")
 
                 conn.commit()
                 logger.info(f"SQLite database initialized: {self.sqlite_path}")
@@ -4893,7 +4903,10 @@ class SQLiteHandler:
         label = identity_label or adopt_label
 
         def select(conn):
-            query = "SELECT client_pubkey, permissions FROM acl_entries WHERE identity_pubkey = ?"
+            query = (
+                "SELECT client_pubkey, permissions, last_login FROM acl_entries "
+                "WHERE identity_pubkey = ?"
+            )
             args = [identity_pubkey]
             if label:
                 query += " AND identity_label = ?"
@@ -4934,15 +4947,30 @@ class SQLiteHandler:
             return [dict(row) for row in select(conn)]
 
     def upsert_acl_entry(
-        self, identity_pubkey: str, identity_label: str, client_pubkey: str, permissions: int
+        self,
+        identity_pubkey: str,
+        identity_label: str,
+        client_pubkey: str,
+        permissions: int,
+        last_login: Optional[float] = None,
     ) -> None:
+        """Store an entry. ``last_login`` None keeps the stored time.
+
+        A row under another label is another identity's leftover, taken over
+        here: its login time is not this entry's, so it is replaced, not kept.
+        """
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO acl_entries (identity_pubkey, identity_label, client_pubkey,
-                                         permissions, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                                         permissions, updated_at, last_login)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(identity_pubkey, client_pubkey) DO UPDATE SET
+                    last_login = CASE
+                        WHEN acl_entries.identity_label = excluded.identity_label
+                        THEN COALESCE(excluded.last_login, acl_entries.last_login)
+                        ELSE excluded.last_login
+                    END,
                     identity_label = excluded.identity_label,
                     permissions = excluded.permissions,
                     updated_at = excluded.updated_at
@@ -4953,7 +4981,16 @@ class SQLiteHandler:
                     client_pubkey.lower(),
                     int(permissions),
                     time.time(),
+                    None if last_login is None else float(last_login),
                 ),
+            )
+
+    def touch_acl_login(self, identity_pubkey: str, client_pubkey: str, last_login: float) -> None:
+        """Record a stored entry's last successful login. A missing entry is left missing."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE acl_entries SET last_login = ? WHERE identity_pubkey = ? AND client_pubkey = ?",
+                (float(last_login), identity_pubkey.lower(), client_pubkey.lower()),
             )
 
     def delete_acl_entry(self, identity_pubkey: str, client_pubkey: str) -> None:
@@ -4995,8 +5032,8 @@ class SQLiteHandler:
             return conn.execute(
                 """
                 INSERT INTO acl_entries (identity_pubkey, identity_label, client_pubkey,
-                                         permissions, updated_at)
-                SELECT ?, ?, client_pubkey, permissions, ?
+                                         permissions, updated_at, last_login)
+                SELECT ?, ?, client_pubkey, permissions, ?, last_login
                 FROM acl_entries WHERE identity_pubkey = ? AND identity_label = ?
                 """,
                 (new_key, new_label, time.time(), old_key, old_label),

@@ -6835,7 +6835,7 @@ components:
           example: 1766065148
         last_login_success:
           type: integer
-          description: Unix timestamp of last successful login
+          description: Unix timestamp of last successful login, 0 if none. Kept across restarts for entries that persist; last_activity resets to 0.
           example: 1766065146
         last_timestamp:
           type: integer
