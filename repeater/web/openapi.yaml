@@ -5708,7 +5708,7 @@ components:
           type: boolean
         reason:
           type: string
-          enum: [null, missing, source_unavailable, invalid, read_failed]
+          enum: ['null', missing, source_unavailable, invalid, read_failed]
     SensorReading:
       type: object
       required: [name, type, ok, timestamp, data]
