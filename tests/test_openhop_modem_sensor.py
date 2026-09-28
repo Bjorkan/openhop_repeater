@@ -17,8 +17,9 @@ class _Response:
     def __exit__(self, *_args):
         return False
 
-    def read(self):
-        return json.dumps(self.payload).encode()
+    def read(self, size=-1):
+        body = json.dumps(self.payload).encode()
+        return body if size < 0 else body[:size]
 
 
 def test_openhop_modem_sensor_exposes_full_flat_diagnostics(monkeypatch):

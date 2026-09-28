@@ -335,6 +335,10 @@ sensors:
     #     password: ""              # modem HTTP password; may match modem_tcp.token
     #     poll_interval_seconds: 60.0  # avoid contending with modem traffic
     #     timeout_seconds: 2.0
+    #     discovery_include_paths: ""  # optional reviewed exact JSON Pointers, comma-separated
+    #     discovery_exclude_paths: ""  # e.g. "/environment/experimental"
+    # Numeric/boolean stats under approved measurement sections are discovered
+    # automatically; metadata/values are API diagnostics only, not RF or RRD history.
 
 
 

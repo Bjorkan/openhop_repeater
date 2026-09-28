@@ -328,6 +328,8 @@ paths:
                     description: Configured USB/TCP radio labels whose live modem link is down; empty when connected or not configured.
                     items:
                       type: string
+                  sensors:
+                    $ref: '#/components/schemas/SensorSummary'
 
   /gps:
     get:
@@ -1105,20 +1107,9 @@ paths:
                       readings:
                         type: array
                         items:
-                          type: object
+                          $ref: '#/components/schemas/SensorReading'
                       summary:
-                        type: object
-                        properties:
-                          enabled:
-                            type: boolean
-                          poll_interval_seconds:
-                            type: number
-                          configured:
-                            type: integer
-                          loaded:
-                            type: integer
-                          running:
-                            type: boolean
+                        $ref: '#/components/schemas/SensorSummary'
 
   # ============================================================================
   # Packet Endpoints
@@ -5688,6 +5679,77 @@ components:
                 type: string
                 enum: [unknown]
   schemas:
+
+    SensorMetricDescriptor:
+      type: object
+      description: One snapshot's local, bounded measurement metadata; identity is configured sensor name plus source-path id.
+      required: [id, source_path, data_key, label, unit, kind, category, available]
+      properties:
+        id:
+          type: string
+          description: RFC6901 JSON Pointer relative to the modem stats response.
+        source_path:
+          type: string
+        data_key:
+          type: string
+          description: Exact key in the flat data object; generic keys begin with modem:.
+        label:
+          type: string
+        unit:
+          type: string
+          nullable: true
+        kind:
+          type: string
+          enum: [number, boolean]
+        category:
+          type: string
+          enum: [measurement, diagnostic, configuration, status]
+        available:
+          type: boolean
+        reason:
+          type: string
+          enum: [null, missing, source_unavailable, invalid, read_failed]
+    SensorReading:
+      type: object
+      required: [name, type, ok, timestamp, data]
+      properties:
+        name:
+          type: string
+        type:
+          type: string
+        ok:
+          type: boolean
+        timestamp:
+          type: string
+          format: date-time
+        data:
+          type: object
+          description: Flat plugin-specific values. Discovered modem values may be null when unavailable; historical fields may be omitted.
+          additionalProperties: true
+        error:
+          type: string
+        metrics:
+          type: array
+          description: Optional snapshot descriptors; absent for unchanged plug-ins. No sensor history or RF telemetry implied.
+          items:
+            $ref: '#/components/schemas/SensorMetricDescriptor'
+    SensorSummary:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+        poll_interval_seconds:
+          type: number
+        configured:
+          type: integer
+        loaded:
+          type: integer
+        running:
+          type: boolean
+        readings:
+          type: array
+          items:
+            $ref: '#/components/schemas/SensorReading'
 
     AirtimeBucket:
       type: object
