@@ -1348,6 +1348,59 @@ def test_telemetry_bme280_emits_temperature_humidity_and_pressure_on_one_channel
     assert lpp == expected
 
 
+def test_modem_discovered_environment_and_agc_do_not_change_rf_bytes(monkeypatch):
+    import json
+
+    from repeater.sensors.openhop_modem import OpenHopModemSensor
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, size):
+            return json.dumps(payload).encode()[:size]
+
+    payload = {
+        "system": {"die_temperature_c": 41},
+        "environment": {
+            "available": True,
+            "temperature_c": 19,
+            "humidity_pct": 52,
+            "pressure_hpa": 1007,
+            "new_value": 2,
+        },
+        "radio": {"agc_reset_count": 3, "last_agc_reset_ms_ago": None},
+    }
+    monkeypatch.setattr(
+        "repeater.sensors.openhop_modem.urllib.request.urlopen",
+        lambda *_args, **_kwargs: Response(),
+    )
+    reading = OpenHopModemSensor("modem", {"settings": {"host": "example.test"}}).read()
+    assert reading["data"]["modem:/environment/temperature_c"] == 19
+    assert reading["data"]["modem:/environment/new_value"] == 2
+    admin = SimpleNamespace(is_guest=lambda: False)
+    guest = SimpleNamespace(is_guest=lambda: True)
+
+    def wire(current, user, mask):
+        helper = ProtocolRequestHelper(
+            identity_manager=MagicMock(),
+            packet_injector=AsyncMock(),
+            sensor_manager=_FakeSensorManager([current]),
+        )
+        return helper._handle_get_telemetry(user, 0, mask)
+
+    baseline = dict(
+        reading, data={k: v for k, v in reading["data"].items() if not k.startswith("modem:")}
+    )
+    for user, mask in ((admin, b"\x00"), (admin, b"\x04"), (guest, b"\x00")):
+        assert wire(reading, user, mask) == wire(baseline, user, mask)
+
+
 def test_telemetry_guest_forced_to_base_only():
     """A guest is restricted to base telemetry even when requesting the full mask."""
     sm = _FakeSensorManager([_reading(temperature_c=21.5, humidity_pct=55.0)])

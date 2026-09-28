@@ -9100,6 +9100,17 @@ class APIEndpoints:
                 if name in names:
                     return self._error(f"Duplicate sensor name: {name}")
                 names.add(name)
+                if defn["type"] in {"openhop_modem", "pymc_modem"}:
+                    from repeater.sensors.modem_stats_discovery import parse_paths
+
+                    policy_settings = defn.get("settings", {})
+                    if isinstance(policy_settings, dict):
+                        for policy_key in ("discovery_include_paths", "discovery_exclude_paths"):
+                            if policy_key in policy_settings:
+                                try:
+                                    parse_paths(policy_settings[policy_key], policy_key)
+                                except (TypeError, ValueError) as exc:
+                                    return self._error(f"definitions[{i}] {exc}")
                 # Preserve masked credentials by stable sensor identity, not list position.
                 settings = defn.get("settings")
                 if isinstance(settings, dict) and settings.get("password") == "*****":

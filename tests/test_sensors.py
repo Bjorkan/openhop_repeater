@@ -189,7 +189,7 @@ def test_pymc_modem_sensor_reads_modem_stats(monkeypatch):
         def __exit__(self, *_args):
             return False
 
-        def read(self):
+        def read(self, size=-1):
             return json.dumps(
                 {
                     "battery_voltage_mv": 4112,
@@ -257,7 +257,7 @@ def test_pymc_modem_sensor_accepts_stats_without_gps_coordinates(monkeypatch):
         def __exit__(self, *_args):
             return False
 
-        def read(self):
+        def read(self, size=-1):
             return json.dumps(
                 {
                     "battery_voltage_mv": 3681,
