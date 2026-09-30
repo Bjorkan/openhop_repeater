@@ -6933,6 +6933,9 @@ class APIEndpoints:
                                     identity=room_identity,
                                     config=identity,
                                     identity_type="room_server",
+                                    # Lets the text helper stop the room's old
+                                    # sync loop, under either name.
+                                    previous_name=old_name,
                                 )
                             )
                         finally:

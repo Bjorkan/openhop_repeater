@@ -568,3 +568,16 @@ def test_giving_a_passwordless_room_a_password_registers_it_live(db, request_ctx
     result = api.update_identity()
     assert "no reload needed" not in result["message"]
     assert daemon.login_helper.get_acl_by_name("room-a").admin_password == "new-admin"
+
+
+def test_a_hot_reload_names_the_room_it_replaces(db, request_ctx):
+    # The text helper stops the replaced RoomServer's sync loop by this name.
+    daemon = _LiveDaemon(db, "room-a", "11" * 32)
+    api = _api(daemon, daemon.config)
+    real = daemon._register_identity_everywhere
+    daemon._register_identity_everywhere = MagicMock(side_effect=real)
+
+    request_ctx.method = "PUT"
+    request_ctx.json = {"name": "room-a", "new_name": "room-b"}
+    api.update_identity()
+    assert daemon._register_identity_everywhere.call_args.kwargs["previous_name"] == "room-a"
