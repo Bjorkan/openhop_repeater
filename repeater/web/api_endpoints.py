@@ -6317,6 +6317,22 @@ class APIEndpoints:
             logger.error(f"Error getting identity: {e}")
             return self._error(e)
 
+    def _identity_name_taken(self, name: str, skip: tuple = None) -> bool:
+        """Whether another identity already uses ``name``.
+
+        Names are unique across the repeater, rooms and companions alike: the
+        boot check (IdentityManager.validate_specs) refuses a duplicate, so
+        saving one would leave a config the next restart cannot load.
+        """
+        if name == "repeater":
+            return True
+        identities = self.config.get("identities") or {}
+        for kind in ("room_servers", "companions"):
+            for i, entry in enumerate(identities.get(kind) or []):
+                if (kind, i) != skip and str(entry.get("name") or "").strip() == name:
+                    return True
+        return False
+
     @cherrypy.expose
     @cherrypy.tools.json_out()
     @cherrypy.tools.json_in()
@@ -6418,8 +6434,8 @@ class APIEndpoints:
                         return self._error("Companion identity_key must be a valid hex string")
 
                 companions = identities_config.get("companions") or []
-                if any(str(c.get("name") or "").strip() == name for c in companions):
-                    return self._error(f"Companion with name '{name}' already exists")
+                if self._identity_name_taken(name):
+                    return self._error(f"Identity with name '{name}' already exists")
 
                 try:
                     bridge_settings = parse_companion_bridge_kwargs(settings)
@@ -6469,8 +6485,15 @@ class APIEndpoints:
             else:
                 # Room server
                 room_servers = identities_config.get("room_servers") or []
-                if any(str(r.get("name") or "").strip() == name for r in room_servers):
+                if self._identity_name_taken(name):
                     return self._error(f"Identity with name '{name}' already exists")
+                # As in update_identity: the boot check refuses a shared key, and
+                # the two rooms would share one access list.
+                new_pubkey = derive_companion_public_key_hex(identity_key)
+                if new_pubkey and new_pubkey in self._other_identity_pubkeys(-1):
+                    return self._error(
+                        "That key is already used by another identity; no change was made"
+                    )
 
                 new_identity = {
                     "name": name,
@@ -6668,12 +6691,8 @@ class APIEndpoints:
                     new_name = str(new_name).strip() if new_name is not None else ""
                     if not new_name:
                         return self._error("new_name cannot be empty")
-                    if any(
-                        str(c.get("name") or "").strip() == new_name
-                        for i, c in enumerate(companions)
-                        if i != identity_index
-                    ):
-                        return self._error(f"Companion with name '{new_name}' already exists")
+                    if self._identity_name_taken(new_name, ("companions", identity_index)):
+                        return self._error(f"Identity with name '{new_name}' already exists")
                     identity["name"] = new_name
 
                 if "identity_key" in data and data["identity_key"]:
@@ -6780,7 +6799,11 @@ class APIEndpoints:
             snapshot = copy.deepcopy(identity)
 
             def refuse(message):
-                identity.clear()
+                # Restore in place: the identity manager holds this dict. Drop
+                # only the added keys, never all of them, so a concurrent config
+                # save cannot catch the room with no name or key.
+                for key in [k for k in identity if k not in snapshot]:
+                    del identity[key]
                 identity.update(snapshot)
                 return self._error(message)
 
@@ -6793,11 +6816,7 @@ class APIEndpoints:
                 if not new_name:
                     return refuse("new_name cannot be empty")
                 # Check if new name conflicts
-                if any(
-                    str(r.get("name") or "").strip() == new_name
-                    for i, r in enumerate(room_servers)
-                    if i != identity_index
-                ):
+                if self._identity_name_taken(new_name, ("room_servers", identity_index)):
                     return refuse(f"Identity with name '{new_name}' already exists")
                 identity["name"] = new_name
 
@@ -6827,6 +6846,8 @@ class APIEndpoints:
                         logger.info(f"Updated identity_key for '{name_s}'")
 
             if "settings" in data:
+                if not isinstance(data["settings"], dict):
+                    return refuse("settings must be an object")
                 # Merge settings
                 if "settings" not in identity:
                     identity["settings"] = {}
@@ -6834,7 +6855,11 @@ class APIEndpoints:
 
                 for field in ("flood_advert_interval_hours", "direct_advert_interval_hours"):
                     if field in identity["settings"]:
-                        hours = int(identity["settings"][field])
+                        try:
+                            hours = int(identity["settings"][field])
+                        except (TypeError, ValueError):
+                            # refuse(), not a raise: the rename above must be undone.
+                            return refuse(f"{field} must be a whole number of hours")
                         if hours != 0 and (hours < 1 or hours > 168):
                             return refuse(f"{field} must be 0 (off) or 1-168 hours")
                         identity["settings"][field] = hours
@@ -7638,7 +7663,8 @@ class APIEndpoints:
         owners = self._acl_owners()
         if identity_name:
             return [o for o in owners if o[0] == identity_name]
-        if identity_hash:
+        if identity_hash is not None and identity_hash != "":  # 0 is a hash byte
+            identity_hash = str(identity_hash)  # JSON may send a number
             target = (
                 int(identity_hash, 16) if identity_hash.startswith("0x") else int(identity_hash)
             )
