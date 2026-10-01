@@ -4473,21 +4473,31 @@ class SQLiteHandler:
         Every other advert stays. One transaction resolved in SQL: all or none,
         and no read of the whole table first.
         """
-        where = "is_repeater = 1 AND zero_hop = 1"
-        params: tuple = ()
-        if pubkey_prefix is not None:
+        # Fixed statements, the prefix bound as a parameter.
+        if pubkey_prefix is None:
+            scope_sql = (
+                "DELETE FROM neighbor_scopes WHERE pubkey IN "
+                "(SELECT lower(pubkey) FROM adverts WHERE is_repeater = 1 AND zero_hop = 1)"
+            )
+            advert_sql = "DELETE FROM adverts WHERE is_repeater = 1 AND zero_hop = 1"
+            params: tuple = ()
+        else:
             # Compared, not LIKE-matched: a stray % or _ must not widen it.
+            scope_sql = (
+                "DELETE FROM neighbor_scopes WHERE pubkey IN "
+                "(SELECT lower(pubkey) FROM adverts WHERE is_repeater = 1 AND zero_hop = 1 "
+                "AND substr(lower(pubkey), 1, ?) = ?)"
+            )
+            advert_sql = (
+                "DELETE FROM adverts WHERE is_repeater = 1 AND zero_hop = 1 "
+                "AND substr(lower(pubkey), 1, ?) = ?"
+            )
             prefix = pubkey_prefix.lower()
-            where += " AND substr(lower(pubkey), 1, ?) = ?"
             params = (len(prefix), prefix)
         try:
             with self._connect() as conn:
-                conn.execute(
-                    "DELETE FROM neighbor_scopes WHERE pubkey IN "
-                    f"(SELECT lower(pubkey) FROM adverts WHERE {where})",
-                    params,
-                )
-                deleted = conn.execute(f"DELETE FROM adverts WHERE {where}", params).rowcount
+                conn.execute(scope_sql, params)
+                deleted = conn.execute(advert_sql, params).rowcount
                 self._neighbors_cache = {"timestamp": 0.0, "value": None}
                 return deleted
         except Exception as e:
