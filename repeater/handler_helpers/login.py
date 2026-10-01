@@ -100,8 +100,8 @@ class LoginHelper:
             admin_password = security.get("admin_password") or None
             guest_password = security.get("guest_password") or None
             final_security = {
-                # Firmware MAX_CLIENTS. Provisioned admins are never evicted and
-                # now survive restarts, so a small table fills permanently.
+                # Firmware MAX_CLIENTS. Admins survive restarts, and only another
+                # admin grant evicts one, so a small table fills up with them.
                 "max_clients": security.get("max_clients", 32),
                 "admin_password": admin_password,
                 "guest_password": guest_password,
@@ -479,7 +479,10 @@ class LoginHelper:
         if owner is not None and owner.get_public_key() == pubkey:
             del self.handlers[hash_byte]
             removed = True
-        for acl in {a for a in self.acls.values() if a.identity_pubkey_hex == pubkey.hex()}:
+        # Both indexes: one whose hash byte another identity took is only
+        # listed by name.
+        listed = [*self.acls.values(), *self.acls_by_name.values()]
+        for acl in {a for a in listed if a.identity_pubkey_hex == pubkey.hex()}:
             acl.detach_store()
             self._drop_acl(acl)
         return removed

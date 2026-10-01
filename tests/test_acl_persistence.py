@@ -788,8 +788,9 @@ def test_stored_entries_past_max_clients_all_load():
     ]
     acl = ACL(max_clients=2, store=_FailingStore(rows), local_identity=LocalIdentity())
     assert acl.load() == 4
-    # Full of admins: newcomers are refused rather than evicting one.
+    # Full of admins: a blank-password newcomer is refused, not given a place.
     assert _login(acl, LocalIdentity(), "", 1) == (False, 0)
+    assert acl.get_num_clients() == 4
 
 
 def test_a_failed_store_read_is_reported_not_shown_as_empty():
@@ -820,18 +821,67 @@ def test_a_full_table_evicts_the_least_active_non_admin():
     assert acl.get_num_clients() == 3
 
 
-def test_a_table_full_of_admins_refuses_rather_than_evicting_one():
+def test_a_table_full_of_admins_evicts_the_least_recently_seen():
+    """Firmware evicts its last slot when every entry is an admin; here the
+    admin seen least recently goes, and a newcomer is never locked out."""
     acl = ACL(max_clients=2, admin_password="adminpw", allow_read_only=True)
     cli = _cli(acl)
-    first, second, newcomer = (LocalIdentity() for _ in range(3))
-    cli._cmd_setperm(f"setperm {first.get_public_key().hex()} 3")
-    cli._cmd_setperm(f"setperm {second.get_public_key().hex()} 3")
+    stale, recent, newcomer = (LocalIdentity() for _ in range(3))
+    cli._cmd_setperm(f"setperm {stale.get_public_key().hex()} 3")
+    cli._cmd_setperm(f"setperm {recent.get_public_key().hex()} 3")
+    acl.get_client(stale.get_public_key()).last_activity = 10
+    acl.get_client(recent.get_public_key()).last_activity = 20
 
-    assert _login(acl, newcomer, "", 1) == (False, 0)
-    assert cli._cmd_setperm(f"setperm {newcomer.get_public_key().hex()} 3") == (
-        "Err - invalid params"
-    )
+    assert _login(acl, newcomer, "adminpw", 1) == (True, PERM_ACL_ADMIN)
+    assert acl.get_client(stale.get_public_key()) is None
+    assert acl.get_client(recent.get_public_key()) is not None
     assert acl.get_num_clients() == 2
+
+
+def test_after_a_restart_the_admin_with_the_oldest_login_is_evicted(db):
+    # Loaded entries have no activity yet, so the stored last login decides,
+    # whatever order the store returns them in.
+    local = LocalIdentity()
+    admins = [LocalIdentity() for _ in range(3)]
+    acl = _repeater_acl(db, local, max_clients=3)
+    for admin in admins:
+        _cli(acl)._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+    for admin, when in zip(admins, (300, 100, 200)):
+        db.touch_acl_login(local.get_public_key().hex(), admin.get_public_key().hex(), when)
+
+    restarted = _repeater_acl(db, local, max_clients=3)
+    assert restarted.load() == 3
+    _cli(restarted)._cmd_setperm(f"setperm {LocalIdentity().get_public_key().hex()} 3")
+
+    assert restarted.get_client(admins[1].get_public_key()) is None
+    assert restarted.get_client(admins[0].get_public_key()) is not None
+    assert restarted.get_client(admins[2].get_public_key()) is not None
+
+
+def test_evicting_a_stored_admin_deletes_it(db):
+    local = LocalIdentity()
+    admin, newcomer = LocalIdentity(), LocalIdentity()
+    acl = _repeater_acl(db, local, max_clients=1)
+    _cli(acl)._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+    _cli(acl)._cmd_setperm(f"setperm {newcomer.get_public_key().hex()} 3")
+
+    stored = _repeater_acl(db, local)
+    assert stored.load() == 1
+    assert stored.get_client(newcomer.get_public_key()) is not None
+
+
+def test_a_failed_grant_puts_an_evicted_admin_back(db):
+    local = LocalIdentity()
+    admin, newcomer = LocalIdentity(), LocalIdentity()
+    acl = _repeater_acl(db, local, max_clients=1)
+    _cli(acl)._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+    db.upsert_acl_entry = MagicMock(side_effect=RuntimeError("disk full"))
+
+    assert _cli(acl)._cmd_setperm(f"setperm {newcomer.get_public_key().hex()} 3") == (
+        "Err - failed to save"
+    )
+    assert acl.get_client(admin.get_public_key()) is not None
+    assert _repeater_acl(db, local).load() == 1
 
 
 def test_evicting_a_stored_entry_deletes_it(db):
@@ -1371,3 +1421,209 @@ def test_deleting_a_room_whose_rename_was_not_reloaded_detaches_its_live_acl(db)
 
     assert _acl_rows(db) == []
     assert helper.get_acl_by_name("room-a") is None
+
+
+def test_unregistering_an_identity_whose_hash_byte_was_taken_detaches_its_acl(db):
+    first = LocalIdentity()
+    second = LocalIdentity()
+    while second.get_public_key()[0] != first.get_public_key()[0]:
+        second = LocalIdentity()
+    helper = _login_helper(db)
+    helper.register_identity("room-a", first, identity_type="room_server", config=ROOM_CFG)
+    displaced = helper.get_acl_by_name("room-a")
+    helper.register_identity("room-b", second, identity_type="room_server", config=ROOM_CFG)
+
+    helper.unregister_identity(first)
+    _cli(displaced)._cmd_setperm(f"setperm {LocalIdentity().get_public_key().hex()} 3")
+
+    assert helper.get_acl_by_name("room-a") is None
+    assert db.load_acl_entries(first.get_public_key().hex()) == []
+
+
+@pytest.mark.parametrize("password", ["", "adminpw"])
+def test_a_refused_login_does_not_evict_anyone(db, password):
+    local = LocalIdentity()
+    admin = LocalIdentity()
+    acl = _repeater_acl(db, local, max_clients=1)
+    _cli(acl)._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+
+    assert _login(acl, LocalIdentity(), password, 0) == (False, 0)  # a replay
+    assert acl.get_client(admin.get_public_key()) is not None
+    assert acl.get_num_clients() == 1
+    assert _repeater_acl(db, local).load() == 1
+
+
+@pytest.mark.parametrize("password", ["", "guestpw"])
+def test_only_an_admin_grant_may_evict_an_admin(db, password):
+    """A blank-password or guest login must not strip provisioned admins."""
+    local = LocalIdentity()
+    admin = LocalIdentity()
+    acl = _repeater_acl(db, local, max_clients=1)
+    _cli(acl)._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+
+    assert _login(acl, LocalIdentity(), password, 1) == (False, 0)
+    assert acl.get_client(admin.get_public_key()) is not None
+    assert _repeater_acl(db, local).load() == 1
+
+
+def test_setperm_to_a_non_admin_role_does_not_evict_an_admin(db):
+    local = LocalIdentity()
+    admin = LocalIdentity()
+    acl = _repeater_acl(db, local, max_clients=1)
+    _cli(acl)._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+
+    reply = _cli(acl)._cmd_setperm(f"setperm {LocalIdentity().get_public_key().hex()} 1")
+    assert reply != "OK"
+    assert acl.get_client(admin.get_public_key()) is not None
+
+
+def test_an_admin_login_that_cannot_be_stored_keeps_the_evicted_admin_stored(db):
+    local = LocalIdentity()
+    admin = LocalIdentity()
+    acl = _repeater_acl(db, local, max_clients=1)
+    _cli(acl)._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+    db.upsert_acl_entry = MagicMock(side_effect=RuntimeError("disk full"))
+
+    assert _login(acl, LocalIdentity(), "adminpw", 1) == (True, PERM_ACL_ADMIN)
+    restarted = _repeater_acl(db, local)
+    assert restarted.load() == 1
+    assert restarted.get_client(admin.get_public_key()) is not None
+
+
+def test_an_evicted_admins_old_login_cannot_be_replayed():
+    acl = ACL(max_clients=1, admin_password="adminpw", local_identity=LocalIdentity())
+    first, second = LocalIdentity(), LocalIdentity()
+    assert _login(acl, first, "adminpw", 200) == (True, PERM_ACL_ADMIN)
+    assert _login(acl, second, "adminpw", 300) == (True, PERM_ACL_ADMIN)  # evicts first
+    assert acl.get_client(first.get_public_key()) is None
+
+    assert _login(acl, first, "adminpw", 100) == (False, 0)  # a captured, older login
+    assert _login(acl, first, "adminpw", 201) == (True, PERM_ACL_ADMIN)
+
+
+def test_a_replay_is_caught_even_when_its_watermark_is_the_oldest_kept():
+    acl = ACL(max_clients=1, admin_password="adminpw", local_identity=LocalIdentity())
+    first = LocalIdentity()
+    assert _login(acl, first, "adminpw", 500) == (True, PERM_ACL_ADMIN)
+    for _ in range(8):  # fill the watermark cache behind the first admin's
+        assert _login(acl, LocalIdentity(), "adminpw", 1000) == (True, PERM_ACL_ADMIN)
+
+    assert _login(acl, first, "adminpw", 500) == (False, 0)
+
+
+def test_an_eviction_left_stored_by_a_failed_write_is_deleted_once_storage_recovers(db):
+    local = LocalIdentity()
+    first, second = LocalIdentity(), LocalIdentity()
+    acl = _repeater_acl(db, local, max_clients=1)
+    _cli(acl)._cmd_setperm(f"setperm {first.get_public_key().hex()} 3")
+    real_upsert = db.upsert_acl_entry
+    db.upsert_acl_entry = MagicMock(side_effect=RuntimeError("disk full"))
+    assert _login(acl, second, "adminpw", 1) == (True, PERM_ACL_ADMIN)
+    db.upsert_acl_entry = real_upsert
+
+    assert _login(acl, second, "adminpw", 2) == (True, PERM_ACL_ADMIN)
+
+    restarted = _repeater_acl(db, local, max_clients=1)
+    assert restarted.load() == 1
+    assert restarted.get_client(second.get_public_key()) is not None
+
+
+def test_a_refused_replay_does_not_lose_the_watermark_on_retry():
+    acl = ACL(max_clients=1, admin_password="adminpw", local_identity=LocalIdentity())
+    first = LocalIdentity()
+    assert _login(acl, first, "adminpw", 500) == (True, PERM_ACL_ADMIN)
+    for _ in range(8):
+        assert _login(acl, LocalIdentity(), "adminpw", 1000) == (True, PERM_ACL_ADMIN)
+
+    assert _login(acl, first, "adminpw", 500) == (False, 0)
+    assert _login(acl, first, "adminpw", 500) == (False, 0)  # and again
+
+
+def test_an_unrelated_write_does_not_drop_a_deferred_eviction(db):
+    local = LocalIdentity()
+    first, second, other = LocalIdentity(), LocalIdentity(), LocalIdentity()
+    acl = _repeater_acl(db, local, max_clients=2)
+    _cli(acl)._cmd_setperm(f"setperm {first.get_public_key().hex()} 3")
+    _cli(acl)._cmd_setperm(f"setperm {other.get_public_key().hex()} 3")
+    acl.get_client(other.get_public_key()).last_activity = 10**12  # first goes
+    real_upsert = db.upsert_acl_entry
+    db.upsert_acl_entry = MagicMock(side_effect=RuntimeError("disk full"))
+    assert _login(acl, second, "adminpw", 1) == (True, PERM_ACL_ADMIN)
+    db.upsert_acl_entry = real_upsert
+
+    _cli(acl)._cmd_setperm(f"setperm {other.get_public_key().hex()} 3")  # unrelated
+
+    restarted = _repeater_acl(db, local, max_clients=2)
+    restarted.load()
+    assert restarted.get_client(first.get_public_key()) is not None  # second not stored
+
+
+def test_a_deferred_eviction_passes_on_when_its_displacer_is_displaced(db):
+    local = LocalIdentity()
+    a, b, c = LocalIdentity(), LocalIdentity(), LocalIdentity()
+    acl = _repeater_acl(db, local, max_clients=1)
+    _cli(acl)._cmd_setperm(f"setperm {a.get_public_key().hex()} 3")
+    real_upsert = db.upsert_acl_entry
+    db.upsert_acl_entry = MagicMock(side_effect=RuntimeError("disk full"))
+    assert _login(acl, b, "adminpw", 1) == (True, PERM_ACL_ADMIN)  # a stays stored
+    db.upsert_acl_entry = real_upsert
+
+    assert _login(acl, c, "adminpw", 1) == (True, PERM_ACL_ADMIN)  # displaces b
+
+    restarted = _repeater_acl(db, local, max_clients=1)
+    assert restarted.load() == 1
+    assert restarted.get_client(c.get_public_key()) is not None
+
+
+def test_replay_watermarks_stay_bounded_while_writes_fail(db):
+    local = LocalIdentity()
+    acl = _repeater_acl(db, local, max_clients=1)
+    db.upsert_acl_entry = MagicMock(side_effect=RuntimeError("disk full"))
+    for _ in range(30):
+        assert _login(acl, LocalIdentity(), "adminpw", 1) == (True, PERM_ACL_ADMIN)
+    assert len(acl._evicted_watermarks) <= 8
+
+
+def test_an_eviction_whose_delete_fails_is_retried_by_the_next_write_of_its_grant(db):
+    local = LocalIdentity()
+    first, second = LocalIdentity(), LocalIdentity()
+    acl = _repeater_acl(db, local, max_clients=1)
+    _cli(acl)._cmd_setperm(f"setperm {first.get_public_key().hex()} 3")
+    real_delete = db.delete_acl_entry
+    db.delete_acl_entry = MagicMock(side_effect=RuntimeError("disk full"))
+    assert _login(acl, second, "adminpw", 1) == (True, PERM_ACL_ADMIN)
+    db.delete_acl_entry = real_delete
+
+    _cli(acl)._cmd_setperm(f"setperm {second.get_public_key().hex()} 3")
+
+    restarted = _repeater_acl(db, local, max_clients=1)
+    assert restarted.load() == 1
+    assert restarted.get_client(second.get_public_key()) is not None
+
+
+def test_a_returning_guest_does_not_keep_its_old_stored_admin_grant(db):
+    local = LocalIdentity()
+    a, b = LocalIdentity(), LocalIdentity()
+    acl = _repeater_acl(db, local, max_clients=1)
+    _cli(acl)._cmd_setperm(f"setperm {a.get_public_key().hex()} 3")
+    real_delete = db.delete_acl_entry
+    db.delete_acl_entry = MagicMock(side_effect=RuntimeError("disk full"))
+    assert _login(acl, b, "adminpw", 1) == (True, PERM_ACL_ADMIN)  # a's row stays
+    assert _login(acl, b, "guestpw", 2) == (True, PERM_ACL_GUEST)
+    assert _login(acl, a, "", 3) == (True, PERM_ACL_GUEST)  # a is back, as a guest
+    db.delete_acl_entry = real_delete
+    assert _login(acl, a, "", 4) == (True, PERM_ACL_GUEST)
+
+    restarted = _repeater_acl(db, local, max_clients=1)
+    restarted.load()
+    stored = restarted.get_client(a.get_public_key())
+    assert stored is None or not stored.is_admin()
+
+
+def test_never_stored_evictions_are_not_queued_for_deletion(db):
+    local = LocalIdentity()
+    acl = _repeater_acl(db, local, max_clients=1)
+    db.upsert_acl_entry = MagicMock(side_effect=RuntimeError("disk full"))
+    for _ in range(30):
+        assert _login(acl, LocalIdentity(), "adminpw", 1) == (True, PERM_ACL_ADMIN)
+    assert acl._pending_evictions == {}

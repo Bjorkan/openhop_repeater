@@ -174,16 +174,18 @@ def test_acl_max_clients_invalid_password_and_remove_client_paths():
     assert ok_a is True
     assert acl.get_num_clients() == 1
 
-    full_ok, full_perms = acl.authenticate_client(id_b, b"s", "a", timestamp=2)
-    assert full_ok is False
-    assert full_perms == 0
+    # Full of admins: firmware putClient evicts the newest entry for B.
+    full_ok, _ = acl.authenticate_client(id_b, b"s", "a", timestamp=2)
+    assert full_ok is True
+    assert acl.get_num_clients() == 1
+    assert acl.get_client(b"C" * 32) is None
 
     bad_ok, bad_perms = acl.authenticate_client(id_a, b"s", "bad", timestamp=3)
     assert bad_ok is False
     assert bad_perms == 0
 
-    assert acl.remove_client(b"C" * 32) is True
-    assert acl.remove_client(b"C" * 32) is False
+    assert acl.remove_client(b"D" * 32) is True
+    assert acl.remove_client(b"D" * 32) is False
 
 
 @pytest.mark.asyncio
