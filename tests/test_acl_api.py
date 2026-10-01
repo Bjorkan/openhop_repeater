@@ -1,5 +1,6 @@
 """ACL management over the web API: listing, setting, removing, and identity changes."""
 
+import copy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -116,6 +117,18 @@ def test_remove_accepts_the_legacy_public_key_field(db, request_ctx):
 
     removed = _post(request_ctx, api.acl_remove_client, {"public_key": admin.hex()})
     assert removed["success"] is True
+
+
+def test_remove_accepts_a_numeric_identity_hash(db, request_ctx):
+    daemon = _Daemon(db, [])
+    api = _api(daemon)
+    acl = daemon.login_helper.get_acl_by_name("repeater")
+    admin = LocalIdentity().get_public_key()
+    acl.apply_permissions(admin, 3)
+    hash_byte = acl.identity_pubkey_hex[:2]
+
+    body = {"identity_hash": int(hash_byte, 16), "client_pubkey": admin.hex()}
+    assert _post(request_ctx, api.acl_remove_client, body)["success"] is True
 
 
 @pytest.mark.parametrize(
@@ -291,6 +304,96 @@ def test_update_identity_refuses_a_key_another_identity_uses(db, request_ctx):
     assert (room["name"], room["identity_key"]) == ("room-a", "11" * 32)
     api.config_manager.save_to_file.assert_not_called()
     assert len(db.load_acl_entries(old_identity.get_public_key().hex())) == 1
+
+
+@pytest.mark.parametrize("taken", ["repeater", "comp-a"])
+def test_a_room_cannot_take_a_name_another_identity_uses(db, request_ctx, taken):
+    """Names are unique across every identity at boot, so a duplicate saved
+    here would leave a config the next restart refuses."""
+    daemon, config, old_identity, admin = _room_update_setup(db)
+    config["identities"]["companions"] = [{"name": "comp-a", "identity_key": "55" * 32}]
+    api = _api(daemon, config)
+
+    live_entry = config["identities"]["room_servers"][0]
+
+    request_ctx.method = "PUT"
+    request_ctx.json = {"name": "room-a", "new_name": taken}
+    result = api.update_identity()
+
+    assert result["success"] is False
+    # Restored in place: the identity manager holds this same dict.
+    assert config["identities"]["room_servers"][0] is live_entry
+    assert live_entry["name"] == "room-a"
+    api.config_manager.save_to_file.assert_not_called()
+
+
+def test_a_new_room_cannot_reuse_another_identitys_key(db, request_ctx):
+    daemon, config, old_identity, admin = _room_update_setup(db)
+    api = _api(daemon, config)
+
+    request_ctx.method = "POST"
+    request_ctx.json = {
+        "name": "room-c",
+        "type": "room_server",
+        "identity_key": "44" * 32,  # room-b's
+        "settings": dict(ROOM_SETTINGS),
+    }
+    result = api.create_identity()
+
+    assert result["success"] is False
+    assert "already used" in result["error"]
+    assert [r["name"] for r in config["identities"]["room_servers"]] == ["room-a", "room-b"]
+    api.config_manager.save_to_file.assert_not_called()
+
+
+@pytest.mark.parametrize("taken", ["repeater", "room-a"])
+def test_a_new_companion_cannot_take_a_name_another_identity_uses(db, request_ctx, taken):
+    daemon, config, old_identity, admin = _room_update_setup(db)
+    api = _api(daemon, config)
+
+    request_ctx.method = "POST"
+    request_ctx.json = {"name": taken, "type": "companion", "identity_key": "66" * 32}
+    result = api.create_identity()
+
+    assert result["success"] is False
+    assert "already exists" in result["error"]
+    api.config_manager.save_to_file.assert_not_called()
+
+
+def test_renaming_a_room_to_its_own_name_is_allowed(db, request_ctx):
+    daemon, config, old_identity, admin = _room_update_setup(db)
+    api = _api(daemon, config)
+
+    request_ctx.method = "PUT"
+    request_ctx.json = {"name": "room-a", "new_name": "room-a"}
+    assert api.update_identity()["success"] is True
+
+
+@pytest.mark.parametrize("settings", ["x", {"flood_advert_interval_hours": "abc"}])
+def test_bad_room_settings_undo_the_rename_in_the_same_request(db, request_ctx, settings):
+    daemon, config, old_identity, admin = _room_update_setup(db)
+    api = _api(daemon, config)
+    before = copy.deepcopy(config["identities"]["room_servers"][0])
+
+    request_ctx.method = "PUT"
+    request_ctx.json = {"name": "room-a", "new_name": "renamed", "settings": settings}
+    assert api.update_identity()["success"] is False
+    assert config["identities"]["room_servers"][0] == before
+
+
+def test_identity_hash_zero_names_hash_byte_zero_not_every_acl(db):
+    """0 is falsy; it must not fall through to "no filter, every ACL"."""
+    api = _api(_Daemon(db, []))
+    owners = api._acl_owners()
+    assert api._acl_targets(None, 0) == [o for o in owners if o[2].get_public_key()[0] == 0]
+    assert api._acl_targets(None, 0) != owners or not owners
+
+
+def test_the_identity_endpoints_stay_exposed():
+    from repeater.web.api_endpoints import APIEndpoints
+
+    for name in ("create_identity", "update_identity", "delete_identity"):
+        assert getattr(getattr(APIEndpoints, name), "exposed", False), name
 
 
 def test_update_identity_does_not_save_a_key_whose_acl_did_not_move(db, request_ctx):
