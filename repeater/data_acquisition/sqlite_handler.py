@@ -3636,7 +3636,7 @@ class SQLiteHandler:
             logger.error(f"Failed to get route stats from SQLite: {e}")
             return {"error": str(e), "data_source": "error"}
 
-    def get_neighbors(self, *, raise_errors: bool = False) -> dict:
+    def get_neighbors(self) -> dict:
         try:
             now = time.time()
             cached = self._neighbors_cache.get("value")
@@ -3685,8 +3685,6 @@ class SQLiteHandler:
 
         except Exception as e:
             logger.error(f"Failed to get neighbors: {e}")
-            if raise_errors:
-                raise
             return {}
 
     def get_noise_floor_history(
@@ -4467,26 +4465,33 @@ class SQLiteHandler:
             logger.error(f"Failed to delete advert: {e}")
             return False
 
-    def delete_neighbors_by_pubkey_prefix(self, pubkey_prefix: Optional[str]) -> int:
-        """Delete neighbor adverts by pubkey prefix (or all when prefix is None)."""
+    def delete_neighbors(self, pubkey_prefix: Optional[str] = None) -> int:
+        """Delete the zero-hop repeaters `get_neighbors` lists as neighbours,
+        those whose pubkey starts with ``pubkey_prefix`` or all of them, with
+        their cached scopes.
+
+        Every other advert stays. One transaction resolved in SQL: all or none,
+        and no read of the whole table first.
+        """
+        where = "is_repeater = 1 AND zero_hop = 1"
+        params: tuple = ()
+        if pubkey_prefix is not None:
+            # Compared, not LIKE-matched: a stray % or _ must not widen it.
+            prefix = pubkey_prefix.lower()
+            where += " AND substr(lower(pubkey), 1, ?) = ?"
+            params = (len(prefix), prefix)
         try:
             with self._connect() as conn:
-                if pubkey_prefix is None:
-                    cursor = conn.execute("DELETE FROM adverts")
-                    conn.execute("DELETE FROM neighbor_scopes")
-                else:
-                    cursor = conn.execute(
-                        "DELETE FROM adverts WHERE lower(pubkey) LIKE ?",
-                        (f"{pubkey_prefix.lower()}%",),
-                    )
-                    conn.execute(
-                        "DELETE FROM neighbor_scopes WHERE pubkey LIKE ?",
-                        (f"{pubkey_prefix.lower()}%",),
-                    )
+                conn.execute(
+                    "DELETE FROM neighbor_scopes WHERE pubkey IN "
+                    f"(SELECT lower(pubkey) FROM adverts WHERE {where})",
+                    params,
+                )
+                deleted = conn.execute(f"DELETE FROM adverts WHERE {where}", params).rowcount
                 self._neighbors_cache = {"timestamp": 0.0, "value": None}
-                return int(cursor.rowcount)
+                return deleted
         except Exception as e:
-            logger.error(f"Failed to delete neighbors by prefix: {e}")
+            logger.error(f"Failed to delete neighbors: {e}")
             raise
 
     # ------------------------------------------------------------------
