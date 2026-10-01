@@ -123,8 +123,9 @@ repeater:
   # passwords and max_clients in its identity's settings (default 50).
   security:
     # Maximum ACL entries for the repeater (firmware MAX_CLIENTS is 32).
-    # Admins are never evicted and are kept across restarts, so a small
-    # table fills up with them.
+    # Admins are kept across restarts, and only a new admin login or
+    # setperm evicts one (the least recently seen), so a small table fills
+    # up with them and then refuses other newcomers.
     max_clients: 32
 
     # Admin password for full access

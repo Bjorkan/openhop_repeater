@@ -240,6 +240,13 @@ class ACL:
         )
         # Permissions as last written to the store, keyed like ``clients``.
         self._persisted: Dict[bytes, int] = {}
+        # Replay watermarks of evicted clients: a key that comes back must not
+        # accept a login it already used. RAM only and capped, like the table.
+        self._evicted_watermarks: Dict[bytes, int] = {}
+        # Evicted entries still stored, keyed to the client that displaced them
+        # (None for one that is never stored): each row is deleted once that
+        # client's grant is stored, never on an unrelated write.
+        self._pending_evictions: Dict[bytes, Optional[bytes]] = {}
         # Login times as last written to the store, so a login in the same
         # second as the stored one costs no write.
         self._persisted_login: Dict[bytes, int] = {}
@@ -276,7 +283,8 @@ class ACL:
 
         Every stored entry is loaded even past ``max_clients``: lowering the
         limit must not silently revoke provisioned grants. An over-full table
-        still evicts non-admins for newcomers and refuses once all are admins.
+        still evicts non-admins for newcomers; once all are admins, only an
+        admin grant evicts one (see ``_put_client``).
 
         A failed read is recorded in ``load_error`` and retried by the next
         login or change, so stored keys work again once the store recovers.
@@ -497,14 +505,19 @@ class ACL:
     # ------------------------------------------------------------------
 
     def _put_client(
-        self, identity: Identity, evicted: Optional[list] = None
+        self, identity: Identity, evicted: Optional[list] = None, admin_grant: bool = False
     ) -> Optional["ClientInfo"]:
         """Find or add a client, firmware ``putClient``. Call under the lock.
 
         When the table is full the least recently active non-admin is evicted.
-        Firmware evicts its last slot, which may be an admin, when every entry
-        is an admin; this refuses instead, so provisioned admins are never
-        dropped to make room for a newcomer.
+        When every entry is an admin, firmware evicts its last slot, whoever
+        the newcomer is. Here only an authenticated admin grant (``admin_grant``:
+        the admin password, or setperm to an admin role) may evict an admin, so
+        a blank-password or guest login cannot strip provisioned admins one by
+        one; any other newcomer is refused. The admin evicted is the one seen
+        least recently, by its last login when it has not been active since a
+        restart: the stored order is not the order entries were added, so a
+        "last slot" would be arbitrary here.
 
         Given ``evicted``, the evicted ``(key, client)`` is appended there and
         its stored entry left for the caller to delete once the newcomer is
@@ -515,25 +528,92 @@ class ACL:
         if client is not None:
             return client
 
+        # Read before an eviction below can prune it.
+        watermark = self._evicted_watermarks.get(pub_key, 0)
         if len(self.clients) >= self.max_clients:
+            if not self.clients:
+                logger.error(f"ACL for '{self._identity_label}' has max_clients={self.max_clients}")
+                return None
             candidates = [(k, c) for k, c in self.clients.items() if not c.is_admin()]
-            if not candidates:
-                logger.error(
-                    f"ACL for '{self._identity_label}' is full: all {len(self.clients)} "
-                    f"entries are admins (max_clients={self.max_clients}); cannot add client"
+            if candidates:
+                evict_key, evict_client = min(candidates, key=lambda kc: kc[1].last_activity)
+                logger.info(f"ACL full, evicted least active client {evict_key[:6].hex()}...")
+            elif not admin_grant:
+                logger.warning(
+                    f"ACL for '{self._identity_label}' is full of admins "
+                    f"(max_clients={self.max_clients}): refused a non-admin newcomer"
                 )
                 return None
-            evict_key, evict_client = min(candidates, key=lambda kc: kc[1].last_activity)
+            else:
+                evict_key, evict_client = min(
+                    self.clients.items(),
+                    key=lambda kc: max(kc[1].last_activity, kc[1].last_login_success),
+                )
+                logger.warning(
+                    f"ACL for '{self._identity_label}' is full of admins "
+                    f"(max_clients={self.max_clients}): evicted the least recently "
+                    f"seen, {evict_key[:6].hex()}..."
+                )
             del self.clients[evict_key]
+            self._evicted_watermarks.pop(evict_key, None)
+            self._evicted_watermarks[evict_key] = evict_client.last_timestamp
             if evicted is not None:
                 evicted.append((evict_key, evict_client))
             else:
                 self._drop_stored_eviction(evict_key)
-            logger.info(f"ACL full, evicted least active client {evict_key[:6].hex()}...")
 
         client = ClientInfo(identity, 0)
+        client.last_timestamp = watermark
         self.clients[pub_key] = client
         return client
+
+    def _undo_put(self, pub_key: bytes, is_new: bool, evicted: list) -> None:
+        """Take back a refused newcomer and put back whoever it displaced."""
+        if is_new:
+            self.clients.pop(pub_key, None)
+        for evict_key, evict_client in evicted:
+            self.clients[evict_key] = evict_client
+            self._evicted_watermarks.pop(evict_key, None)  # back with its own
+
+    def _defer_evictions(self, evicted: list, replacement: Optional[bytes]) -> None:
+        for evict_key, _ in evicted:
+            # Its own outstanding evictions pass to whoever displaced it.
+            for key, owner in self._pending_evictions.items():
+                if owner == evict_key:
+                    self._pending_evictions[key] = replacement
+            if evict_key in self._persisted:  # nothing to delete otherwise
+                self._pending_evictions[evict_key] = replacement
+        self._trim_watermarks()
+
+    def _trim_watermarks(self) -> None:
+        # Only after a login or grant is accepted, so a refused one can never
+        # push out the watermark that refuses its replay. Past the cap the
+        # oldest go: that key's next login is then checked as a newcomer's, as
+        # firmware checks every evicted client's. A pending eviction dropped
+        # here just stays stored, and returns after a restart.
+        cap = max(self.max_clients, 1) * 8
+        for table in (self._evicted_watermarks, self._pending_evictions):
+            while len(table) > cap:
+                del table[next(iter(table))]
+
+    def _commit_evictions(self, evicted: list, replacement: Optional[bytes] = None) -> None:
+        """Delete the entries ``replacement`` displaced, now that it is stored.
+
+        Called once ``replacement``'s grant is written (None: it is never
+        stored), so this also completes its evictions that an earlier failed
+        write left stored. Another client's evictions are left alone.
+        """
+        self._defer_evictions(evicted, replacement)
+        for evict_key, owner in list(self._pending_evictions.items()):
+            if owner != replacement:
+                continue
+            # Writes whatever it is now: deleted if gone, its current grant if
+            # it came back (as a guest, its stored admin row is deleted too).
+            try:
+                self._sync_entry(evict_key)
+            except ACLStoreError:
+                continue  # still stored; the next write of this grant retries
+            del self._pending_evictions[evict_key]
 
     def _drop_stored_eviction(self, evict_key: bytes) -> None:
         try:
@@ -587,7 +667,9 @@ class ACL:
             existing = self.clients.get(pub_key)
             previous = existing.permissions if existing is not None else None
             evicted = []
-            client = self._put_client(identity, evicted)
+            client = self._put_client(
+                identity, evicted, admin_grant=is_admin_permissions(permissions)
+            )
             if client is None:
                 return False
             client.permissions = permissions
@@ -596,15 +678,12 @@ class ACL:
                 self._sync_entry(pub_key)
             except ACLStoreError:
                 if previous is None:
-                    self.clients.pop(pub_key, None)
                     # The grant failed, so nobody made room for it.
-                    for evict_key, evict_client in evicted:
-                        self.clients[evict_key] = evict_client
+                    self._undo_put(pub_key, True, evicted)
                 else:
                     client.permissions = previous
                 raise
-            for evict_key, _ in evicted:
-                self._drop_stored_eviction(evict_key)
+            self._commit_evictions(evicted, bytes(pub_key))
             logger.info(f"setperm: {pub_key[:6].hex()}... permissions=0x{permissions:02X}")
             return True
 
@@ -721,13 +800,16 @@ class ACL:
 
         pub_key = client_identity.get_public_key()[:PUB_KEY_SIZE]
 
+        # Whoever a newcomer displaces stays until the login is accepted.
+        evicted = []
         if not password:
+            is_new = pub_key not in self.clients
             client = self.clients.get(pub_key)
             if client is None:
                 if not self.allow_read_only:
                     logger.info("Blank password, sender not in ACL and read-only disabled")
                     return False, 0
-                client = self._put_client(client_identity)
+                client = self._put_client(client_identity, evicted)
                 if client is None:
                     return False, 0
                 client.permissions = PERM_ACL_GUEST
@@ -739,7 +821,9 @@ class ACL:
                 logger.info(f"ACL-based login for {pub_key[:6].hex()}...")
 
             if self._is_replay(client, timestamp):
+                self._undo_put(pub_key, is_new, evicted)
                 return False, 0
+            self._commit_evictions(evicted)
             self._touch_client_session(client, shared_secret, timestamp, sync_since=sync_since)
             self._record_login(bytes(pub_key), client)
             # No role normalisation needed: PERM_ACL_GUEST *is* role 0, so a
@@ -768,13 +852,16 @@ class ACL:
             return False, 0
 
         is_new = pub_key not in self.clients
-        client = self._put_client(client_identity)
+        client = self._put_client(
+            client_identity, evicted, admin_grant=permissions == PERM_ACL_ADMIN
+        )
         if client is None:
             return False, 0
         if is_new:
             logger.info(f"Added new client {pub_key[:6].hex()}...")
 
         if self._is_replay(client, timestamp):
+            self._undo_put(pub_key, is_new, evicted)
             return False, 0
         self._touch_client_session(client, shared_secret, timestamp, sync_since=sync_since)
         client.permissions &= ~PERM_ACL_ROLE_MASK
@@ -782,11 +869,14 @@ class ACL:
         # Firmware saves after any non-guest password login. _sync_entry writes
         # only when the stored permissions changed, and a guest has none to store.
         # A failed write does not fail the login: the session is valid, and the
-        # grant is written by the next change that succeeds.
+        # grant is written by the next change that succeeds. Whoever it evicted
+        # is then left stored, so a restart cannot lose both grants.
         try:
             self._sync_entry(pub_key)
         except ACLStoreError:
-            pass
+            self._defer_evictions(evicted, bytes(pub_key))
+        else:
+            self._commit_evictions(evicted, bytes(pub_key))
         self._record_login(bytes(pub_key), client)
 
         logger.info(f"Login success! Role: {client.role_name()}")
