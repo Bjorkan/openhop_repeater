@@ -4853,22 +4853,21 @@ class SQLiteHandler:
         found: Dict[str, Dict[str, Optional[str]]] = {}
         try:
             with self._connect() as conn:
-                marks = ",".join("?" * len(keys))
-                for pubkey, name, contact_type in conn.execute(
-                    f"SELECT pubkey, node_name, contact_type FROM adverts "
-                    f"WHERE pubkey IN ({marks}) AND node_name IS NOT NULL AND node_name != ''",
-                    keys,
-                ):
+                query = (
+                    "SELECT pubkey, node_name, contact_type FROM adverts "
+                    "WHERE node_name IS NOT NULL AND node_name != ''"
+                )
+                query += f" AND pubkey IN ({','.join('?' * len(keys))})"
+                for pubkey, name, contact_type in conn.execute(query, keys):
                     found[pubkey.lower()] = {"name": name, "contact_type": contact_type}
                 missing = [k for k in keys if k not in found]
                 if missing:
-                    marks = ",".join("?" * len(missing))
-                    for pubkey, name in conn.execute(
-                        f"SELECT lower(hex(pubkey)), name FROM companion_contacts "
-                        f"WHERE lower(hex(pubkey)) IN ({marks}) AND name != '' "
-                        f"ORDER BY lastmod DESC",
-                        missing,
-                    ):
+                    query = (
+                        "SELECT lower(hex(pubkey)), name FROM companion_contacts WHERE name != ''"
+                    )
+                    query += f" AND lower(hex(pubkey)) IN ({','.join('?' * len(missing))})"
+                    query += " ORDER BY lastmod DESC"
+                    for pubkey, name in conn.execute(query, missing):
                         found.setdefault(pubkey, {"name": name, "contact_type": None})
         except Exception as e:
             logger.debug(f"Could not look up node names: {e}")
