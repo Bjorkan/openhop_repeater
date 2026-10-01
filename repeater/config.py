@@ -517,19 +517,26 @@ def _checked_modem_sync_word(sync_word: int, board_config: dict, radio_type: str
     These are the drivers that actually push the value to the radio, and a
     modem on another sync word connects, answers pings and transmits, yet hears
     no MeshCore traffic -- a silent failure. A radios[] entry inherits the
-    top-level ``radio.sync_word``, which the SX1262 driver ignores, so a stray
-    top-level value is harmless until a modem entry picks it up.
+    top-level ``radio.sync_word``, which the SX1262 driver ignores (SX1262Radio
+    stores it but never calls setSyncWord), so a stray top-level value is
+    harmless until a modem entry picks it up.
     """
     if sync_word != MESHCORE_SYNC_WORD:
-        radio_id = board_config.get("_radio_id")
+        radio_id = board_config.get("_radio_label") or board_config.get("_radio_id")
+        if radio_id:
+            where = f"radios[{radio_id}].radio"
+            if board_config.get("_sync_word_inherited"):
+                where += " (it inherits the top-level radio.sync_word)"
+        else:
+            where = "its radio section"
         logger.warning(
             "%s sync_word is 0x%X, not MeshCore's 0x%02X: the modem will not hear "
-            "MeshCore traffic. Set sync_word: 0x%02X in its radio section%s.",
+            "MeshCore traffic. Set sync_word: 0x%02X in %s.",
             f"Radio {radio_id!r} ({radio_type})" if radio_id else f"{radio_type} radio",
             sync_word,
             MESHCORE_SYNC_WORD,
             MESHCORE_SYNC_WORD,
-            " (radios[] entries inherit the top-level radio.sync_word)" if radio_id else "",
+            where,
         )
     return sync_word
 
@@ -920,6 +927,10 @@ def _merge_radio_entry(global_config: dict, entry: dict) -> dict:
         raise ValueError(f"radios[] entry {radio_id!r} missing radio_type")
 
     merged["_radio_id"] = str(radio_id)
+    # build_radio_stack pops _radio_id; this survives it, to name the radio in logs.
+    merged["_radio_label"] = str(radio_id)
+    own_radio = entry.get("radio") if isinstance(entry.get("radio"), dict) else {}
+    merged["_sync_word_inherited"] = "sync_word" not in own_radio
     # Hint for CH341 path: do not install process-global SPI/GPIO defaults.
     merged["_ch341_per_instance"] = True
     return merged
