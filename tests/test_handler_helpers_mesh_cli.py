@@ -897,5 +897,14 @@ def test_ver_reports_the_installed_repeater_and_core_versions(identity_type, rol
 
     cli = MeshCLI("/tmp/cfg.yaml", _base_config(), _cfg_mgr(), identity_type=identity_type)
     assert cli.handle_command(b"\x00" * 32, "ver", True) == (
-        f"openHop_{role} v{repeater.__version__} (core v{openhop_core.__version__})"
+        f"openHop_{role} v{repeater.__version__} "
+        f"(core v{getattr(openhop_core, '__version__', 'unknown')})"
     )
+
+
+def test_ver_survives_a_core_without_a_version(monkeypatch):
+    import openhop_core
+
+    monkeypatch.delattr(openhop_core, "__version__", raising=False)
+    cli = MeshCLI("/tmp/cfg.yaml", _base_config(), _cfg_mgr(), identity_type="repeater")
+    assert cli.handle_command(b"\x00" * 32, "ver", True).endswith("(core vunknown)")

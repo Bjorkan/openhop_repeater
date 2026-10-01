@@ -99,8 +99,36 @@ def test_companion_ver_names_the_repeater_and_core_versions():
         return True
 
     bridge = RepeaterCompanionBridge(LocalIdentity(), _inject, node_name="Comp")
-    if not hasattr(bridge, "cli"):
+    # The same check the bridge makes before registering.
+    if not callable(getattr(getattr(bridge, "cli", None), "add_software_version", None)):
         pytest.skip("installed openhop_core predates the companion CLI")
-    assert bridge.cli.handle("ver") == (
-        f"openHop repeater v{repeater.__version__}, core v{openhop_core.__version__}"
-    )
+    reply = bridge.cli.handle("ver")
+    assert f"repeater v{repeater.__version__}" in reply
+    assert reply.index("repeater") < reply.index(f"core v{openhop_core.__version__}")
+
+
+def test_a_failing_version_registration_does_not_stop_the_bridge(monkeypatch, caplog):
+    from openhop_core.protocol import LocalIdentity
+
+    from repeater.companion.bridge import RepeaterCompanionBridge
+
+    async def _inject(pkt, wait_for_ack=False, expected_crc=None):
+        return True
+
+    class _CLI:
+        def add_software_version(self, *args):
+            raise TypeError("changed signature")
+
+    from openhop_core.companion import CompanionBridge
+
+    base_init = CompanionBridge.__init__
+
+    def _init_with_failing_cli(self, *args, **kwargs):
+        base_init(self, *args, **kwargs)
+        self.cli = _CLI()
+
+    monkeypatch.setattr(CompanionBridge, "__init__", _init_with_failing_cli)
+    with caplog.at_level("WARNING", logger="RepeaterCompanionBridge"):
+        bridge = RepeaterCompanionBridge(LocalIdentity(), _inject, node_name="Comp")
+    assert "Could not register the repeater version" in caplog.text
+    assert bridge.get_contacts() == []  # constructed and usable

@@ -99,7 +99,11 @@ class RepeaterCompanionBridge(CompanionBridge):
         # ahead of the core. An older core has no companion CLI to tell.
         add_version = getattr(getattr(self, "cli", None), "add_software_version", None)
         if callable(add_version):
-            add_version("repeater", repeater_version)
+            try:
+                add_version("repeater", repeater_version)
+            except Exception as e:
+                # Cosmetic: never let it stop the companion loading.
+                logger.warning("Could not register the repeater version with the CLI: %s", e)
 
     def _save_prefs(self) -> None:
         """Persist full NodePrefs as JSON to SQLite."""
