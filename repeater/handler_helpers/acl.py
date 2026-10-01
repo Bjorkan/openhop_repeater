@@ -496,13 +496,19 @@ class ACL:
     # Table management
     # ------------------------------------------------------------------
 
-    def _put_client(self, identity: Identity) -> Optional["ClientInfo"]:
+    def _put_client(
+        self, identity: Identity, evicted: Optional[list] = None
+    ) -> Optional["ClientInfo"]:
         """Find or add a client, firmware ``putClient``. Call under the lock.
 
         When the table is full the least recently active non-admin is evicted.
         Firmware evicts its last slot, which may be an admin, when every entry
         is an admin; this refuses instead, so provisioned admins are never
         dropped to make room for a newcomer.
+
+        Given ``evicted``, the evicted ``(key, client)`` is appended there and
+        its stored entry left for the caller to delete once the newcomer is
+        stored, so a failed write can put it back.
         """
         pub_key = bytes(identity.get_public_key()[:PUB_KEY_SIZE])
         client = self.clients.get(pub_key)
@@ -517,19 +523,25 @@ class ACL:
                     f"entries are admins (max_clients={self.max_clients}); cannot add client"
                 )
                 return None
-            evict_key, _ = min(candidates, key=lambda kc: kc[1].last_activity)
+            evict_key, evict_client = min(candidates, key=lambda kc: kc[1].last_activity)
             del self.clients[evict_key]
-            try:
-                self._sync_entry(evict_key)
-            except ACLStoreError:
-                # Still stored; it returns after a restart. Evicting it from
-                # memory must not block the newcomer.
-                pass
+            if evicted is not None:
+                evicted.append((evict_key, evict_client))
+            else:
+                self._drop_stored_eviction(evict_key)
             logger.info(f"ACL full, evicted least active client {evict_key[:6].hex()}...")
 
         client = ClientInfo(identity, 0)
         self.clients[pub_key] = client
         return client
+
+    def _drop_stored_eviction(self, evict_key: bytes) -> None:
+        try:
+            self._sync_entry(evict_key)
+        except ACLStoreError:
+            # Still stored; it returns after a restart. Evicting it from
+            # memory must not block the newcomer.
+            pass
 
     def apply_permissions(self, pub_key: bytes, permissions: int) -> bool:
         """``setperm``, firmware ``ClientACL::applyPermissions``.
@@ -574,7 +586,8 @@ class ACL:
                 return False
             existing = self.clients.get(pub_key)
             previous = existing.permissions if existing is not None else None
-            client = self._put_client(identity)
+            evicted = []
+            client = self._put_client(identity, evicted)
             if client is None:
                 return False
             client.permissions = permissions
@@ -584,9 +597,14 @@ class ACL:
             except ACLStoreError:
                 if previous is None:
                     self.clients.pop(pub_key, None)
+                    # The grant failed, so nobody made room for it.
+                    for evict_key, evict_client in evicted:
+                        self.clients[evict_key] = evict_client
                 else:
                     client.permissions = previous
                 raise
+            for evict_key, _ in evicted:
+                self._drop_stored_eviction(evict_key)
             logger.info(f"setperm: {pub_key[:6].hex()}... permissions=0x{permissions:02X}")
             return True
 
