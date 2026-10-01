@@ -591,6 +591,11 @@ radio:
   # Preamble length in symbols
   preamble_length: 32
 
+  # LoRa sync word, used by modem_tcp/modem_usb radios (the SX1262 driver
+  # ignores it). MeshCore uses 0x12; a modem on any other value hears nothing.
+  # radios[] entries inherit this value unless they set their own.
+  # sync_word: 0x12
+
   # Use implicit header mode
   implicit_header: false
 

@@ -364,7 +364,7 @@ def test_a_radios_entry_inheriting_a_stray_top_level_sync_word_is_named(monkeypa
 
     assert captured["sync_word"] == 0x3444
     assert "Radio 'narrow' (modem_tcp) sync_word is 0x3444" in caplog.text
-    assert "inherit the top-level radio.sync_word" in caplog.text
+    assert "inherits the top-level radio.sync_word" in caplog.text
 
 
 def test_a_radios_entry_overriding_the_stray_sync_word_is_not_warned_about(monkeypatch, caplog):
@@ -398,3 +398,67 @@ def test_an_explicit_null_sync_word_means_the_default(monkeypatch, caplog, radio
 
     assert captured["sync_word"] == 0x12
     assert "sync_word" not in caplog.text
+
+
+def test_build_radio_stack_names_the_radios_entry_with_the_stray_sync_word(monkeypatch, caplog):
+    """The real path: build_radio_stack pops _radio_id before building the
+    radio, so the warning must still name the entry."""
+    from repeater.config import build_radio_stack
+
+    captured = _capture_modem(monkeypatch, "modem_tcp")
+    config = {
+        "radio_type": "sx1262",
+        "radio": {**_modem_radio_cfg(), "sync_word": 13380},
+        "radios": [
+            {
+                "id": "narrow",
+                "radio_type": "modem_tcp",
+                "radio": {"frequency": 910525000},
+                "modem_tcp": {"host": "192.168.50.154"},
+            }
+        ],
+    }
+
+    with caplog.at_level("WARNING", logger="Config"):
+        build_radio_stack(config)
+
+    assert captured["sync_word"] == 0x3444
+    assert "Radio 'narrow' (modem_tcp) sync_word is 0x3444" in caplog.text
+    assert "inherits the top-level radio.sync_word" in caplog.text
+
+
+def test_each_modem_entry_gets_its_own_sync_word_and_warning(monkeypatch, caplog):
+    from repeater.config import build_radio_stack
+
+    pytest.importorskip("openhop_core.hardware.tcp_radio")
+    built = []
+
+    class _Dummy(_DummyRadio):
+        def __init__(self, **kwargs):
+            built.append(kwargs)
+
+    monkeypatch.setattr("openhop_core.hardware.tcp_radio.TCPLoRaRadio", _Dummy)
+    config = {
+        "radio_type": "sx1262",
+        "radio": {**_modem_radio_cfg(), "sync_word": 13380},
+        "radios": [
+            {"id": "local", "radio_type": "modem_tcp", "modem_tcp": {"host": "10.0.0.1"}},
+            {
+                "id": "narrow",
+                "radio_type": "modem_tcp",
+                "radio": {"sync_word": 0x34},
+                "modem_tcp": {"host": "10.0.0.2"},
+            },
+        ],
+        "fabric": {"default_radio": "local"},
+    }
+
+    with caplog.at_level("WARNING", logger="Config"):
+        build_radio_stack(config)
+
+    assert [b["sync_word"] for b in built] == [0x3444, 0x34]
+    lines = [r.getMessage() for r in caplog.records]
+    local = next(m for m in lines if "Radio 'local'" in m)
+    narrow = next(m for m in lines if "Radio 'narrow'" in m)
+    assert "radios[local].radio (it inherits" in local
+    assert "radios[narrow].radio." in narrow and "inherits" not in narrow
