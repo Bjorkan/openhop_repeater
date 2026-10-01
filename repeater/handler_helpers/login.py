@@ -452,7 +452,11 @@ class LoginHelper:
         from repeater.handler_helpers.acl import acl_identity_label
 
         live = self.acls_by_name.get(name)
-        if live is not None and live.store_key == pubkey_hex.lower():
+        if live is None or live.store_key != pubkey_hex.lower():
+            # As in move_room_acl: a refused hot reload leaves the live ACL
+            # under its old name, still writing rows for this key.
+            live = self._live_acl_for_store_key(pubkey_hex)
+        if live is not None:
             live.detach_store()
             self._drop_acl(live)
         if self.sqlite_handler is None:

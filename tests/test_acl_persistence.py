@@ -844,6 +844,21 @@ def test_evicting_a_stored_entry_deletes_it(db):
     assert _repeater_acl(db, local).load() == 0
 
 
+def test_a_failed_grant_on_a_full_table_does_not_evict_anyone(db):
+    local = LocalIdentity()
+    reader, newcomer = LocalIdentity(), LocalIdentity()
+    acl = _repeater_acl(db, local, max_clients=1)
+    _cli(acl)._cmd_setperm(f"setperm {reader.get_public_key().hex()} 1")
+    db.upsert_acl_entry = MagicMock(side_effect=RuntimeError("disk full"))
+
+    assert _cli(acl)._cmd_setperm(f"setperm {newcomer.get_public_key().hex()} 3") == (
+        "Err - failed to save"
+    )
+    assert acl.get_client(reader.get_public_key()) is not None
+    assert acl.get_client(newcomer.get_public_key()) is None
+    assert _repeater_acl(db, local).load() == 1
+
+
 # ---------------------------------------------------------------------------
 # LoginHelper wiring
 # ---------------------------------------------------------------------------
@@ -1335,3 +1350,24 @@ def test_a_room_renamed_to_a_deleted_rooms_name_does_not_inherit_its_rows(db):
     assert renamed.load() == 1
     assert renamed.get_client(own.get_public_key()) is not None
     assert renamed.get_client(admin.get_public_key()) is None
+
+
+def test_deleting_a_room_whose_rename_was_not_reloaded_detaches_its_live_acl(db):
+    # Codex: rename A to B with the hot reload refused, so the live ACL is
+    # still listed under A, then delete B. A grant through that ACL must not
+    # write B's rows back.
+    key = LocalIdentity()
+    admin, later = LocalIdentity(), LocalIdentity()
+    helper = _login_helper(db)
+    helper.register_identity("room-a", key, identity_type="room_server", config=ROOM_CFG)
+    live = helper.get_acl_by_name("room-a")
+    _cli(live)._cmd_setperm(f"setperm {admin.get_public_key().hex()} 3")
+    key_hex = key.get_public_key().hex()
+    helper.move_room_acl("room-a", key_hex, key_hex, "room-b")
+    assert helper.get_acl_by_name("room-a") is live
+
+    helper.forget_identity_acl("room-b", key_hex)
+    _cli(live)._cmd_setperm(f"setperm {later.get_public_key().hex()} 3")
+
+    assert _acl_rows(db) == []
+    assert helper.get_acl_by_name("room-a") is None
