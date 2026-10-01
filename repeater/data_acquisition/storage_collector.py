@@ -797,8 +797,8 @@ class StorageCollector:
     def get_route_stats(self, hours: int = 24, radio_profiles: Optional[list] = None) -> dict:
         return self.sqlite_handler.get_route_stats(hours, radio_profiles=radio_profiles)
 
-    def get_neighbors(self, *, raise_errors: bool = False) -> dict:
-        return self.sqlite_handler.get_neighbors(raise_errors=raise_errors)
+    def get_neighbors(self) -> dict:
+        return self.sqlite_handler.get_neighbors()
 
     def get_neighbor_scopes(self) -> dict:
         return self.sqlite_handler.get_neighbor_scopes()
@@ -929,8 +929,8 @@ class StorageCollector:
     def delete_advert(self, advert_id: int) -> bool:
         return self.sqlite_handler.delete_advert(advert_id)
 
-    def delete_neighbors_by_pubkey_prefix(self, pubkey_prefix: str | None) -> int:
-        return self.sqlite_handler.delete_neighbors_by_pubkey_prefix(pubkey_prefix)
+    def delete_neighbors(self, pubkey_prefix: str | None = None) -> int:
+        return self.sqlite_handler.delete_neighbors(pubkey_prefix)
 
     def get_hardware_stats(self) -> Optional[dict]:
         """Get current hardware statistics"""

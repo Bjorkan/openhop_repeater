@@ -1232,7 +1232,7 @@ class MeshCLI:
         if not self.storage_handler:
             return "Error: Storage not available"
 
-        delete_fn = getattr(self.storage_handler, "delete_neighbors_by_pubkey_prefix", None)
+        delete_fn = getattr(self.storage_handler, "delete_neighbors", None)
         if not callable(delete_fn):
             return "Error: neighbor.remove not supported by storage backend"
 
@@ -1244,16 +1244,10 @@ class MeshCLI:
             return "ERR: bad pubkey"
 
         try:
-            if pubkey_hex == "all":
-                # Only what `neighbors` lists (firmware clears its neighbour
-                # table), not every advert: companions, rooms and multi-hop
-                # nodes stay.
-                # raise_errors: a failed read must not pass for "no neighbours".
-                neighbors = self.storage_handler.get_neighbors(raise_errors=True)
-                for pubkey in self._zero_hop_repeaters(neighbors or {}):
-                    delete_fn(pubkey)
-            else:
-                delete_fn(pubkey_hex)
+            # Only what `neighbors` lists (firmware removes from its neighbour
+            # table), not every advert: companions, rooms and multi-hop nodes
+            # stay, whatever the key matches.
+            delete_fn(None if pubkey_hex == "all" else pubkey_hex)
             return "OK"
         except Exception as e:
             logger.error(f"neighbor.remove failed: {e}", exc_info=True)
