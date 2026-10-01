@@ -3,7 +3,7 @@ import logging
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
-from openhop_core import __version__ as core_version
+import openhop_core
 
 from repeater import __version__ as repeater_version
 
@@ -478,6 +478,8 @@ class MeshCLI:
         fallback "v13" in every real deployment.
         """
         role = "room_server" if self.identity_type == "room_server" else "repeater"
+        # A core without __version__ must not stop this module importing.
+        core_version = getattr(openhop_core, "__version__", "unknown")
         return f"openHop_{role} v{repeater_version} (core v{core_version})"
 
     # ==================== Get Commands ====================
