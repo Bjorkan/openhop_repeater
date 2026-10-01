@@ -238,6 +238,17 @@ class CompanionFrameServer(_BaseFrameServer):
             contact_dict,
         )
 
+    async def _on_contact_deleted(self, pub_key) -> None:
+        """Push the deletion and delete the overwritten contact from SQLite (non-blocking)."""
+        super()._on_contact_deleted(pub_key)
+        if not self.sqlite_handler:
+            return
+        await asyncio.to_thread(
+            self.sqlite_handler.companion_delete_contact,
+            self.companion_hash,
+            pub_key,
+        )
+
     async def _save_contacts(self) -> None:
         """Persist all contacts to SQLite (non-blocking)."""
         if not self.sqlite_handler:

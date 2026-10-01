@@ -4934,6 +4934,20 @@ class SQLiteHandler:
             logger.error(f"Failed to upsert companion contact: {e}")
             return False
 
+    def companion_delete_contact(self, companion_hash: str, pubkey: bytes) -> bool:
+        """Delete a single contact for a companion from storage."""
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "DELETE FROM companion_contacts WHERE companion_hash = ? AND pubkey = ?",
+                    (companion_hash, pubkey),
+                )
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Failed to delete companion contact: {e}")
+            return False
+
     # ``adverts.contact_type`` stores the *display* name written via
     # handler_helpers.discovery.NODE_TYPE_NAMES ("Chat Node", "Repeater",
     # "Room Server", "Sensor"). The import API speaks MeshCore's names
