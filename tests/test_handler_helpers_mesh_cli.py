@@ -885,6 +885,8 @@ def test_neighbor_remove_takes_the_cached_scopes_with_it(tmp_path):
 
     assert cli.handle_command(b"\x00" * 32, "neighbor.remove all", True) == "OK"
     assert set(handler.get_neighbor_scopes()) == {companion}
+
+
 @pytest.mark.parametrize(
     ("identity_type", "role"), [("repeater", "repeater"), ("room_server", "room_server")]
 )

@@ -277,6 +277,7 @@ class APIEndpoints:
             cherrypy.response.headers["Access-Control-Allow-Headers"] = (
                 "Content-Type, Authorization"
             )
+
     @cherrypy.expose
     def default(self, *args, **kwargs):
         """Handle default requests"""
@@ -6972,7 +6973,9 @@ class APIEndpoints:
                                     identity=room_identity,
                                     config=identity,
                                     identity_type="room_server",
-                                    previous_name=name_s,
+                                    # Lets the text helper stop the room's old
+                                    # sync loop, under either name.
+                                    previous_name=old_name,
                                 )
                             )
                         finally:
