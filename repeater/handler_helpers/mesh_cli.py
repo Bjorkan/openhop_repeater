@@ -231,7 +231,7 @@ class MeshCLI:
         # Neighbor commands
         elif command == "neighbors":
             return self._cmd_neighbors()
-        elif command.startswith("neighbor.remove "):
+        elif command == "neighbor.remove" or command.startswith("neighbor.remove "):
             return self._cmd_neighbor_remove(command)
         elif command.startswith("discover.scopes"):
             return self._cmd_discover_scopes(command)
@@ -312,7 +312,8 @@ class MeshCLI:
             "",
             "Other:",
             "  neighbors           List neighbors",
-            "  neighbor.remove <key>  Remove neighbor by pubkey",
+            "  neighbor.remove <key>  Remove neighbors by pubkey (prefix)",
+            "  neighbor.remove all    Remove all neighbors",
             "  discover.neighbors  Send zero-hop neighbor discovery",
             "  discover.scopes     Discover neighbor scopes, publish to MQTT",
             "  tempradio <freq> <bw> <sf> <cr> <timeout_mins>",
@@ -1218,6 +1219,15 @@ class MeshCLI:
 
     # ==================== Neighbor Commands ====================
 
+    @staticmethod
+    def _zero_hop_repeaters(neighbors: dict) -> dict:
+        """The nodes MeshCore keeps as neighbours: repeaters heard zero-hop."""
+        return {
+            pubkey: info
+            for pubkey, info in neighbors.items()
+            if info.get("is_repeater", False) and info.get("zero_hop", False)
+        }
+
     def _cmd_neighbors(self) -> str:
         """List neighbors."""
         if not self.storage_handler:
@@ -1230,11 +1240,7 @@ class MeshCLI:
                 return "No neighbors discovered yet"
 
             # Match MeshCore behavior: show only zero-hop repeaters.
-            filtered_neighbors = {
-                pubkey: info
-                for pubkey, info in neighbors.items()
-                if info.get("is_repeater", False) and info.get("zero_hop", False)
-            }
+            filtered_neighbors = self._zero_hop_repeaters(neighbors)
 
             if not filtered_neighbors:
                 return "No zero hop repeaters discovered yet"
@@ -1264,30 +1270,40 @@ class MeshCLI:
             return f"Error: {e}"
 
     def _cmd_neighbor_remove(self, command: str) -> str:
-        """Remove a neighbor."""
-        raw_suffix = command[16:]
-        pubkey_hex = raw_suffix.strip()
+        """Remove neighbors whose public key starts with the given hex, or all.
 
-        # Keep MeshCore parity: plain empty is invalid, whitespace-only means remove all.
-        if raw_suffix == "":
-            return "ERR: Missing pubkey"
+        Firmware (CommonCLI.cpp ``neighbor.remove``) takes a hex pubkey prefix of
+        whole bytes, at most 32, and answers "ERR: bad pubkey" for an odd-length
+        or longer key. It also clears every neighbour when the key is empty,
+        which a stray trailing space can trigger; here clearing them all takes
+        an explicit ``neighbor.remove all`` and an empty key gets a hint.
+        """
+        # handle_command has already stripped the line, so a trailing space
+        # never reaches here: "neighbor.remove " arrives as "neighbor.remove".
+        pubkey_hex = command[len("neighbor.remove") :].strip()
+
+        if pubkey_hex == "":
+            return "ERR: Missing pubkey. Do you mean `neighbor.remove all`?"
 
         if not self.storage_handler:
             return "Error: Storage not available"
 
-        delete_fn = getattr(self.storage_handler, "delete_neighbors_by_pubkey_prefix", None)
+        delete_fn = getattr(self.storage_handler, "delete_neighbors", None)
         if not callable(delete_fn):
             return "Error: neighbor.remove not supported by storage backend"
 
+        if pubkey_hex != "all" and (
+            len(pubkey_hex) % 2 != 0
+            or len(pubkey_hex) > 64
+            or any(ch not in "0123456789abcdefABCDEF" for ch in pubkey_hex)
+        ):
+            return "ERR: bad pubkey"
+
         try:
-            if pubkey_hex == "":
-                delete_fn(None)
-                return "OK"
-
-            if any(ch not in "0123456789abcdefABCDEF" for ch in pubkey_hex):
-                return "ERR: bad pubkey"
-
-            delete_fn(pubkey_hex)
+            # Only what `neighbors` lists (firmware removes from its neighbour
+            # table), not every advert: companions, rooms and multi-hop nodes
+            # stay, whatever the key matches.
+            delete_fn(None if pubkey_hex == "all" else pubkey_hex)
             return "OK"
         except Exception as e:
             logger.error(f"neighbor.remove failed: {e}", exc_info=True)

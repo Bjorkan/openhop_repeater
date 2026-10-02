@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from repeater.handler_helpers.mesh_cli import MeshCLI
 
 
@@ -306,15 +308,17 @@ def test_misc_commands_and_routes():
     assert cli._cmd_tempradio("tempradio 915 125 7 5 nope") == "Error, invalid params"
     assert cli._cmd_tempradio("tempradio 915 125 7 5 10").startswith("Error:")
 
-    assert cli._cmd_neighbor_remove("neighbor.remove") == "ERR: Missing pubkey"
+    assert cli._cmd_neighbor_remove("neighbor.remove") == (
+        "ERR: Missing pubkey. Do you mean `neighbor.remove all`?"
+    )
 
-    storage = SimpleNamespace(delete_neighbors_by_pubkey_prefix=MagicMock(return_value=1))
+    storage = SimpleNamespace(delete_neighbors=MagicMock(return_value=1))
     cli.storage_handler = storage
-    assert cli._cmd_neighbor_remove("neighbor.remove abc") == "OK"
-    storage.delete_neighbors_by_pubkey_prefix.assert_called_with("abc")
+    assert cli._cmd_neighbor_remove("neighbor.remove abcd") == "OK"
+    storage.delete_neighbors.assert_called_with("abcd")
 
-    assert cli._cmd_neighbor_remove("neighbor.remove    ") == "OK"
-    storage.delete_neighbors_by_pubkey_prefix.assert_called_with(None)
+    assert cli._cmd_neighbor_remove("neighbor.remove all") == "OK"
+    storage.delete_neighbors.assert_called_with(None)
 
     assert cli._cmd_neighbor_remove("neighbor.remove zz") == "ERR: bad pubkey"
 
@@ -701,3 +705,183 @@ def test_cli_set_commands_persist_with_real_config_manager(tmp_path):
     assert saved["delays"]["rx_delay_base"] == 4.5
     assert saved["delays"]["tx_delay_factor"] == 1.5
     assert saved["delays"]["direct_tx_delay_factor"] == 0.25
+
+
+def _neighbor_cli():
+    cli = MeshCLI("/tmp/cfg.yaml", _base_config(), _cfg_mgr())
+    storage = SimpleNamespace(delete_neighbors=MagicMock(return_value=1))
+    cli.storage_handler = storage
+    return cli, storage.delete_neighbors
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["neighbor.remove", "neighbor.remove ", "neighbor.remove    ", "ab|neighbor.remove "],
+)
+def test_neighbor_remove_without_a_key_hints_at_remove_all(command):
+    """handle_command strips the line, so a trailing space or spaces-only key
+    arrives as a bare "neighbor.remove". Firmware would clear every neighbour
+    for an empty key (CommonCLI.cpp:241-251); here that needs an explicit
+    `neighbor.remove all`, and nothing is deleted."""
+    cli, delete = _neighbor_cli()
+    reply = cli.handle_command(b"\x00" * 32, command, True)
+
+    assert reply.endswith("ERR: Missing pubkey. Do you mean `neighbor.remove all`?")
+    assert reply.startswith("ab|") == command.startswith("ab|")
+    delete.assert_not_called()
+
+
+def test_neighbor_remove_all_asks_storage_for_every_neighbour():
+    cli, delete = _neighbor_cli()
+    assert cli.handle_command(b"\x00" * 32, "neighbor.remove all", True) == "OK"
+    delete.assert_called_once_with(None)
+
+
+def test_neighbor_remove_all_keeps_every_other_advert_in_real_storage(tmp_path):
+    """`neighbor.remove all` clears what `neighbors` lists -- as firmware clears
+    its neighbour table -- not the whole advert history."""
+    from repeater.data_acquisition.sqlite_handler import SQLiteHandler
+
+    handler = SQLiteHandler(tmp_path)
+
+    def advert(pubkey, is_repeater, zero_hop):
+        handler.store_advert(
+            {
+                "pubkey": pubkey,
+                "node_name": pubkey[:4],
+                "is_repeater": is_repeater,
+                "route_type": 1,
+                "contact_type": "repeater" if is_repeater else "companion",
+                "zero_hop": zero_hop,
+                "rssi": -50,
+                "snr": 5.0,
+            }
+        )
+
+    advert("aa" * 32, True, True)  # zero-hop repeater: a neighbour
+    advert("bb" * 32, True, False)  # repeater heard through others
+    advert("cc" * 32, False, True)  # zero-hop companion
+
+    cli = MeshCLI("/tmp/cfg.yaml", _base_config(), _cfg_mgr())
+    cli.storage_handler = handler
+    assert cli.handle_command(b"\x00" * 32, "neighbor.remove all", True) == "OK"
+
+    remaining = set(handler.get_neighbors())
+    assert remaining == {"bb" * 32, "cc" * 32}
+
+
+@pytest.mark.parametrize("key", ["ab", "ABCD", "a1" * 32])
+def test_neighbor_remove_takes_a_whole_byte_hex_prefix_up_to_32_bytes(key):
+    cli, delete = _neighbor_cli()
+    assert cli.handle_command(b"\x00" * 32, f"neighbor.remove {key}", True) == "OK"
+    delete.assert_called_once_with(key)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "abc",  # odd length: firmware fromHex needs whole bytes
+        "a1" * 32 + "ff",  # 33 bytes: firmware's fromHex refuses it too
+        "zz",  # not hex (firmware is laxer here; openhop refuses)
+        "ALL",  # only lowercase `all` means everything
+        "all ab",
+    ],
+)
+def test_neighbor_remove_rejects_a_malformed_key(key):
+    cli, delete = _neighbor_cli()
+    assert cli.handle_command(b"\x00" * 32, f"neighbor.remove {key}", True) == "ERR: bad pubkey"
+    delete.assert_not_called()
+
+
+def test_neighbor_remove_help_lists_remove_all():
+    cli, _ = _neighbor_cli()
+    assert "neighbor.remove all" in cli.handle_command(b"\x00" * 32, "help", True)
+
+
+def test_neighbor_remove_all_reports_an_unreachable_store_instead_of_ok(tmp_path):
+    """Clearing must not report OK when it could not reach the database."""
+    from repeater.data_acquisition.sqlite_handler import SQLiteHandler
+
+    handler = SQLiteHandler(tmp_path)
+    cli = MeshCLI("/tmp/cfg.yaml", _base_config(), _cfg_mgr())
+    cli.storage_handler = handler
+
+    with patch.object(handler, "_connect", side_effect=RuntimeError("database is locked")):
+        reply = cli.handle_command(b"\x00" * 32, "neighbor.remove all", True)
+
+    assert reply == "Error: database is locked"
+
+
+def _storage_with_adverts(tmp_path, adverts):
+    from repeater.data_acquisition.sqlite_handler import SQLiteHandler
+
+    handler = SQLiteHandler(tmp_path)
+    for i, (pubkey, is_repeater, zero_hop) in enumerate(adverts):
+        handler.store_advert(
+            {
+                "timestamp": 1_700_000_000 + i,
+                "pubkey": pubkey,
+                "node_name": pubkey[:4],
+                "is_repeater": is_repeater,
+                "route_type": 1,
+                "contact_type": "repeater" if is_repeater else "companion",
+                "zero_hop": zero_hop,
+                "rssi": -50,
+                "snr": 5.0,
+            }
+        )
+    return handler
+
+
+def test_neighbor_remove_by_key_leaves_other_nodes_sharing_the_prefix(tmp_path):
+    """Firmware's removeNeighbor only touches its neighbour table, so a short
+    prefix must not take a companion or a distant repeater's history with it."""
+    neighbour, companion, distant = "aa" + "11" * 31, "aa" + "22" * 31, "aa" + "33" * 31
+    handler = _storage_with_adverts(
+        tmp_path, [(neighbour, True, True), (companion, False, True), (distant, True, False)]
+    )
+    for pubkey in (neighbour, companion, distant):
+        handler.record_neighbor_scope(pubkey, "ok", scopes="#a")
+    cli = MeshCLI("/tmp/cfg.yaml", _base_config(), _cfg_mgr())
+    cli.storage_handler = handler
+
+    assert cli.handle_command(b"\x00" * 32, "neighbor.remove aa", True) == "OK"
+    assert set(handler.get_neighbors()) == {companion, distant}
+    assert set(handler.get_neighbor_scopes()) == {companion, distant}
+
+
+@pytest.mark.parametrize("pattern", ["%", "_", "a%"])
+def test_delete_neighbors_takes_the_prefix_literally(tmp_path, pattern):
+    handler = _storage_with_adverts(tmp_path, [("ab" * 32, True, True)])
+    assert handler.delete_neighbors(pattern) == 0
+    assert set(handler.get_neighbors()) == {"ab" * 32}
+
+
+def test_neighbor_remove_all_removes_none_if_any_delete_fails(tmp_path):
+    first, second = "aa" * 32, "bb" * 32
+    handler = _storage_with_adverts(tmp_path, [(first, True, True), (second, True, True)])
+    handler.record_neighbor_scope(second, "ok", scopes="#a")
+    with handler._connect() as conn:
+        conn.execute(
+            f"CREATE TRIGGER refuse BEFORE DELETE ON adverts WHEN old.pubkey = '{first}' "
+            "BEGIN SELECT RAISE(ABORT, 'database is locked'); END"
+        )
+    cli = MeshCLI("/tmp/cfg.yaml", _base_config(), _cfg_mgr())
+    cli.storage_handler = handler
+
+    assert cli.handle_command(b"\x00" * 32, "neighbor.remove all", True).startswith("Error:")
+    handler._neighbors_cache = {"timestamp": 0.0, "value": None}  # read the table itself
+    assert set(handler.get_neighbors()) == {first, second}
+    assert second in handler.get_neighbor_scopes()  # rolled back with the adverts
+
+
+def test_neighbor_remove_takes_the_cached_scopes_with_it(tmp_path):
+    neighbour, companion = "aa" * 32, "bb" * 32
+    handler = _storage_with_adverts(tmp_path, [(neighbour, True, True), (companion, False, True)])
+    handler.record_neighbor_scope(neighbour.upper(), "ok", scopes="#a")
+    handler.record_neighbor_scope(companion, "ok", scopes="#b")
+    cli = MeshCLI("/tmp/cfg.yaml", _base_config(), _cfg_mgr())
+    cli.storage_handler = handler
+
+    assert cli.handle_command(b"\x00" * 32, "neighbor.remove all", True) == "OK"
+    assert set(handler.get_neighbor_scopes()) == {companion}

@@ -929,8 +929,8 @@ class StorageCollector:
     def delete_advert(self, advert_id: int) -> bool:
         return self.sqlite_handler.delete_advert(advert_id)
 
-    def delete_neighbors_by_pubkey_prefix(self, pubkey_prefix: str | None) -> int:
-        return self.sqlite_handler.delete_neighbors_by_pubkey_prefix(pubkey_prefix)
+    def delete_neighbors(self, pubkey_prefix: str | None = None) -> int:
+        return self.sqlite_handler.delete_neighbors(pubkey_prefix)
 
     def get_hardware_stats(self) -> Optional[dict]:
         """Get current hardware statistics"""
