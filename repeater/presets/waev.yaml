@@ -8,14 +8,12 @@
 #
 # Reference all Waev endpoints with: brokers: [{preset: waev}]
 #
-# Redundancy model: a single client connection to `mqtt.waev.app`. The
-# Waev edge Worker (see waev/src/router.ts: MQTT_PRIMARY_FAILOVER_TIMEOUT_MS)
-# fans the WebSocket upgrade to broker A first with a 1500 ms timeout,
-# then transparently retries against broker B on failure. Operators who
-# want to pin to a single container can edit the broker after import and
-# set `host`/`audience` to one of:
-#   - mqtt-a.waev.app   (force primary, no failover)
-#   - mqtt-b.waev.app   (force backup)
+# Redundancy model: a single client connection to `mqtt.waev.app`. Waev
+# routes each connection to one of its two broker pools and, if that pool
+# does not accept the connection, to the other. To prefer a pool, override
+# (or edit) `host` with one of these; each still falls back to the other:
+#   - mqtt-a.waev.app   (prefer A)
+#   - mqtt-b.waev.app   (prefer B)
 #
 # Optional UI metadata. Consumed by the GET /api/broker_presets endpoint
 # so the React/Vue admin can render this preset in the "From Template"

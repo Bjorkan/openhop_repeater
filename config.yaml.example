@@ -848,8 +848,8 @@ mqtt_brokers:
   #
   # brokers:
   #   - preset: waev
-  #   - name: waev-b
-  #     enabled: false
+  #   - name: Waev
+  #     host: mqtt-a.waev.app
   #
   # Mix presets with fully custom brokers in the same list:
   #
