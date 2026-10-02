@@ -22,6 +22,38 @@ def _request(api):
     return api.sensors_config_update()
 
 
+@pytest.mark.parametrize(
+    "setting,value",
+    [
+        ("discovery_include_paths", "not-a-pointer"),
+        ("discovery_exclude_paths", "/environment/bad~2escape"),
+        ("discovery_include_paths", ["/radio/reviewed"]),
+    ],
+)
+def test_sensor_update_rejects_invalid_modem_policy_without_persisting(tmp_path, setting, value):
+    path = tmp_path / "config.yaml"
+    original = b"sensors: {enabled: true}\n"
+    path.write_bytes(original)
+    config = {"sensors": {"enabled": True}}
+    api = APIEndpoints(config=config, config_path=str(path))
+    cherrypy.request.method = "POST"
+    cherrypy.request.json = {
+        "enabled": True,
+        "definitions": [
+            {
+                "name": "modem",
+                "type": "openhop_modem",
+                "settings": {"host": "example.test", setting: value},
+            }
+        ],
+    }
+    result = api.sensors_config_update()
+    assert result["success"] is False
+    assert setting in str(result)
+    assert path.read_bytes() == original
+    assert config == {"sensors": {"enabled": True}}
+
+
 @pytest.mark.parametrize("failure", ["dump", "fsync", "replace"])
 def test_sensor_update_failure_preserves_file_and_memory(tmp_path, monkeypatch, failure):
     from repeater import config_manager

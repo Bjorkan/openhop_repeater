@@ -46,14 +46,28 @@ class SensorBase(ABC):
             data = self._read()
         except Exception as exc:
             self.log.warning("Sensor read failed for %s: %s", self.name, exc)
-            return self._result(ok=False, timestamp=timestamp, error=f"{type(exc).__name__}: {exc}")
+            result = self._result(
+                ok=False, timestamp=timestamp, error=f"{type(exc).__name__}: {exc}"
+            )
+            metadata = self._reading_metrics(False)
+            if metadata is not None:
+                result["metrics"] = metadata
+            return result
 
         if data is None:
             data = {}
         if not isinstance(data, dict):
             data = {"value": data}
 
-        return self._result(ok=True, timestamp=timestamp, data=data)
+        result = self._result(ok=True, timestamp=timestamp, data=data)
+        metadata = self._reading_metrics(True)
+        if metadata is not None:
+            result["metrics"] = metadata
+        return result
+
+    def _reading_metrics(self, ok: bool) -> list[dict[str, Any]] | None:
+        """Optional metadata from the same read; unchanged plug-ins omit it."""
+        return None
 
     def _result(
         self,
