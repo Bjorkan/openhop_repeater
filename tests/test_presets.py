@@ -37,12 +37,10 @@ def test_list_presets_returns_bundled_names():
 def test_get_preset_waev_uses_alias_for_server_side_failover():
     """Waev preset ships ONE broker pointing at the alias host.
 
-    The Waev edge Worker (waev/src/router.ts:
-    MQTT_PRIMARY_FAILOVER_TIMEOUT_MS) does server-side A/B failover on
-    `mqtt.waev.app`. Repeaters connect once and let the Worker handle
-    redundancy - we explicitly do NOT want to materialize two independent
-    client connections, because that would defeat the dedup-on-pubkey-hash
-    contract on the waev ingest side.
+    Waev does server-side A/B failover on `mqtt.waev.app`. Repeaters
+    connect once and let Waev handle redundancy - we explicitly do NOT
+    want to materialize two independent client connections, because that
+    would defeat the dedup-on-pubkey-hash contract on the waev ingest side.
     """
     preset = get_preset("waev")
     brokers = preset.get("brokers", [])
@@ -191,12 +189,12 @@ def test_expand_preset_entries_drops_unknown_preset_with_warning(caplog):
 # Pass 2: override-by-name merge
 # --------------------------------------------------------------------
 def test_merge_overrides_by_name_pins_waev_to_primary():
-    """Override AFTER preset wins: an operator can pin to broker A only.
+    """Override AFTER preset wins: an operator can prefer broker A.
 
-    Use case: an operator wants to bypass the server-side failover and
-    target broker A directly (e.g. while debugging a B-specific issue).
-    They re-point the single Waev broker's host/audience to mqtt-a.waev.app
-    via an override after the preset expansion.
+    Use case: an operator wants broker A first (e.g. while debugging a
+    B-specific issue); Waev still falls back to B. They re-point the single
+    Waev broker's host/audience to mqtt-a.waev.app via an override after
+    the preset expansion.
     """
     pre_expanded = _expand_preset_entries([{"preset": "waev"}])
     merged = _merge_overrides_by_name(
