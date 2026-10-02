@@ -1861,7 +1861,7 @@ class APIEndpoints:
             try:
                 import openhop_core
 
-                stats["core_version"] = openhop_core.__version__
+                stats["core_version"] = getattr(openhop_core, "__version__", "unknown")
             except ImportError:
                 stats["core_version"] = "unknown"
             image_info = get_buildroot_image_info()
