@@ -7578,14 +7578,10 @@ class APIEndpoints:
             if not self.daemon_instance or not hasattr(self.daemon_instance, "login_helper"):
                 return self._error("Login helper not available")
 
-            target_hash = None
+            target_prefix = None
             if identity_hash:
                 try:
-                    target_hash = (
-                        int(identity_hash, 16)
-                        if identity_hash.startswith("0x")
-                        else int(identity_hash)
-                    )
+                    target_prefix = self._parse_hash_prefix(identity_hash)
                 except ValueError:
                     return self._error(f"Invalid identity_hash format: {identity_hash}")
 
@@ -7606,7 +7602,7 @@ class APIEndpoints:
                 identity_pubkey = identity.get_public_key()
                 if identity_name and name != identity_name:
                     continue
-                if target_hash is not None and identity_pubkey[0] != target_hash:
+                if target_prefix is not None and not identity_pubkey.startswith(target_prefix):
                     continue
 
                 if acl.load_error:
@@ -7676,8 +7672,9 @@ class APIEndpoints:
         """The public-key prefix a hash names, as ``_fmt_hash`` formats it.
 
         A "0x" string carries its width (2-byte mode lists "0x0042", not "0x42").
-        A number does not, so it is read at the configured width, widened to fit.
-        Raises ValueError for anything else.
+        A number does not, so it takes the fewest bytes that hold it: 0-255 is
+        one hash byte, as it was before multi-byte modes. Raises ValueError for
+        anything else.
         """
         text = str(identity_hash).strip()  # JSON may send a number
         if text[:2].lower() == "0x":
@@ -7688,8 +7685,7 @@ class APIEndpoints:
         value = int(text)
         if value < 0:
             raise ValueError("negative hash")
-        width = max(self._hash_byte_count(), (value.bit_length() + 7) // 8)
-        return value.to_bytes(width, "big")
+        return value.to_bytes(max(1, (value.bit_length() + 7) // 8), "big")
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
