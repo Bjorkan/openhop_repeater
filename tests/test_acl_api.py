@@ -131,6 +131,50 @@ def test_remove_accepts_a_numeric_identity_hash(db, request_ctx):
     assert _post(request_ctx, api.acl_remove_client, body)["success"] is True
 
 
+@pytest.mark.parametrize("path_hash_mode", [1, 2])
+def test_remove_matches_the_multi_byte_hash_acl_clients_lists(db, request_ctx, path_hash_mode):
+    """acl_clients lists a 2- or 3-byte identity_hash; remove must accept it back."""
+    daemon = _Daemon(db, [])
+    api = _api(daemon, {"mesh": {"path_hash_mode": path_hash_mode}})
+    acl = daemon.login_helper.get_acl_by_name("repeater")
+    admin = LocalIdentity().get_public_key()
+    acl.apply_permissions(admin, 3)
+
+    request_ctx.method = "GET"
+    listed = api.acl_clients(identity_name="repeater")["data"]["clients"]
+    identity_hash = listed[0]["identity_hash"]
+    assert len(identity_hash) == 2 + 2 * (path_hash_mode + 1)
+
+    removed = _post(
+        request_ctx,
+        api.acl_remove_client,
+        {"identity_hash": identity_hash, "client_pubkey": admin.hex()},
+    )
+    assert removed["success"] is True
+    assert removed["data"]["removed_from"] == ["repeater"]
+    assert db.load_acl_entries(daemon.local_identity.get_public_key().hex()) == []
+
+
+def test_a_multi_byte_hash_does_not_select_an_identity_sharing_only_its_first_byte(db):
+    api = _api(_Daemon(db, []), {"mesh": {"path_hash_mode": 1}})
+    (owner,) = api._acl_owners()
+    key = owner[2].get_public_key()
+    other = bytes([key[0], key[1] ^ 0xFF])
+    assert api._acl_targets(None, f"0x{key[:2].hex().upper()}") == [owner]
+    assert api._acl_targets(None, f"0x{other.hex()}") == []
+    # A number has no width of its own; it is read at the configured 2 bytes.
+    assert api._acl_targets(None, int.from_bytes(key[:2], "big")) == [owner]
+
+
+@pytest.mark.parametrize("identity_hash", ["0x", "0xzz", "-1", "nope"])
+def test_remove_rejects_a_malformed_identity_hash(db, request_ctx, identity_hash):
+    api = _api(_Daemon(db, []))
+    body = {"identity_hash": identity_hash, "client_pubkey": "aa" * 32}
+    result = _post(request_ctx, api.acl_remove_client, body)
+    assert result["success"] is False
+    assert "identity_hash" in result["error"]
+
+
 @pytest.mark.parametrize(
     "body, message",
     [

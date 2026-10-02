@@ -389,6 +389,11 @@ class APIEndpoints:
 
         return None
 
+    def _hash_byte_count(self) -> int:
+        """Bytes in a node hash under the configured path_hash_mode."""
+        mode = self.config.get("mesh", {}).get("path_hash_mode", 0)
+        return {0: 1, 1: 2, 2: 3}.get(mode, 1)
+
     def _fmt_hash(self, pubkey: bytes) -> str:
         """Format a node hash as a hex string respecting the configured path_hash_mode.
 
@@ -396,8 +401,7 @@ class APIEndpoints:
         path_hash_mode 1           → 2-byte  "0x1927"
         path_hash_mode 2           → 3-byte  "0x192722"
         """
-        mode = self.config.get("mesh", {}).get("path_hash_mode", 0)
-        byte_count = {0: 1, 1: 2, 2: 3}.get(mode, 1)
+        byte_count = self._hash_byte_count()
         hex_chars = byte_count * 2
         value = int.from_bytes(bytes(pubkey[:byte_count]), "big")
         return f"0x{value:0{hex_chars}X}"
@@ -7664,12 +7668,28 @@ class APIEndpoints:
         if identity_name:
             return [o for o in owners if o[0] == identity_name]
         if identity_hash is not None and identity_hash != "":  # 0 is a hash byte
-            identity_hash = str(identity_hash)  # JSON may send a number
-            target = (
-                int(identity_hash, 16) if identity_hash.startswith("0x") else int(identity_hash)
-            )
-            return [o for o in owners if o[2].get_public_key()[0] == target]
+            prefix = self._parse_hash_prefix(identity_hash)
+            return [o for o in owners if o[2].get_public_key().startswith(prefix)]
         return owners
+
+    def _parse_hash_prefix(self, identity_hash) -> bytes:
+        """The public-key prefix a hash names, as ``_fmt_hash`` formats it.
+
+        A "0x" string carries its width (2-byte mode lists "0x0042", not "0x42").
+        A number does not, so it is read at the configured width, widened to fit.
+        Raises ValueError for anything else.
+        """
+        text = str(identity_hash).strip()  # JSON may send a number
+        if text[:2].lower() == "0x":
+            digits = text[2:]
+            if not digits:
+                raise ValueError("empty hash")
+            return bytes.fromhex(digits.zfill(len(digits) + len(digits) % 2))
+        value = int(text)
+        if value < 0:
+            raise ValueError("negative hash")
+        width = max(self._hash_byte_count(), (value.bit_length() + 7) // 8)
+        return value.to_bytes(width, "big")
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
