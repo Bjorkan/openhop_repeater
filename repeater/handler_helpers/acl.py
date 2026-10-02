@@ -806,14 +806,21 @@ class ACL:
             is_new = pub_key not in self.clients
             client = self.clients.get(pub_key)
             if client is None:
-                if not self.allow_read_only:
+                # Firmware simple_repeater compares the blank password with
+                # guest_password, so an empty guest password admits anyone as a
+                # guest. Room servers keep requiring allow_read_only.
+                open_guest = not is_room_server and not guest_pwd
+                if not (self.allow_read_only or open_guest):
                     logger.info("Blank password, sender not in ACL and read-only disabled")
                     return False, 0
                 client = self._put_client(client_identity, evicted)
                 if client is None:
                     return False, 0
                 client.permissions = PERM_ACL_GUEST
-                logger.info("Blank password, allowing read-only guest access")
+                if self.allow_read_only:
+                    logger.info("Blank password, allowing read-only guest access")
+                else:
+                    logger.info("Blank password, no guest password set: allowing guest access")
             else:
                 # Firmware skips the replay check and the session touch on this
                 # path. We keep both: a replayed blank-password login from a
