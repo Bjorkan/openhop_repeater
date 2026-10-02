@@ -201,7 +201,12 @@ class TextHelper:
         task.add_done_callback(_on_done)
 
     def register_identity(
-        self, name: str, identity, identity_type: str = "room_server", radio_config=None
+        self,
+        name: str,
+        identity,
+        identity_type: str = "room_server",
+        radio_config=None,
+        previous_name: str | None = None,
     ):
 
         hash_byte = identity.get_public_key()[0]
@@ -260,12 +265,20 @@ class TextHelper:
                     send_advert_callback=self.send_advert_callback,
                     identity=identity,
                     storage_handler=self.sqlite_handler,
+                    acl=identity_acl,
                 )
                 logger.info(
                     "Initialized CLI handler for repeater commands with identity and storage"
                 )
 
-        # Create RoomServer instance for room_server identities
+        # A re-registration (hot reload after a rename or key change) replaces
+        # a live RoomServer; take the old ones out so their sync loops can be
+        # stopped before the replacement starts, or a room pushes posts twice.
+        stale_rooms = []
+        if identity_type == "room_server":
+            stale_rooms = self._take_stale_room_servers(hash_byte, {name, previous_name})
+
+        room_server = None
         if identity_type == "room_server" and self.sqlite_handler:
             try:
                 from .room_server import MAX_UNSYNCED_POSTS
@@ -296,36 +309,88 @@ class TextHelper:
 
                 self.room_servers[hash_byte] = room_server
 
-                # Start sync loop — may be called from a non-async HTTP handler thread
-                try:
-                    loop = asyncio.get_running_loop()
-                    start_task = loop.create_task(room_server.start())
-                    self._track_task(start_task)
-                except RuntimeError:
-                    # No running event loop in this thread
-                    if self._loop and self._loop.is_running():
-                        future = asyncio.run_coroutine_threadsafe(room_server.start(), self._loop)
-                        future.add_done_callback(
-                            lambda f: (
-                                logger.error(
-                                    f"Room server '{name}' failed: {f.exception()}",
-                                    exc_info=f.exception(),
-                                )
-                                if not f.cancelled() and f.exception()
-                                else None
-                            )
-                        )
-                    else:
-                        logger.error(f"Cannot start room server '{name}': no event loop available")
-
                 logger.info(
                     f"Registered room server '{name}': hash=0x{hash_byte:02X}, "
                     f"max_posts={max_posts}"
                 )
             except Exception as e:
+                room_server = None
                 logger.error(f"Failed to create room server '{name}': {e}", exc_info=True)
 
+        if stale_rooms or room_server:
+            self._schedule_room_swap(name, stale_rooms, room_server)
+
         logger.info(f"Registered {identity_type} '{name}' text handler: hash=0x{hash_byte:02X}")
+
+    def unregister_identity(self, identity) -> bool:
+        """Stop handling messages for ``identity``, and its room's sync loop.
+
+        For a deleted identity, or the old key of one given a new key. Only
+        what belongs to this identity goes; another identity now registered
+        on the same hash byte keeps its handler.
+        """
+        pubkey = identity.get_public_key()
+        hash_byte = pubkey[0]
+        entry = self.handlers.get(hash_byte)
+        if entry is None or entry["identity"].get_public_key() != pubkey:
+            return False
+        del self.handlers[hash_byte]
+        room = self.room_servers.get(hash_byte)
+        if room is not None and room.local_identity.get_public_key() == pubkey:
+            del self.room_servers[hash_byte]
+            self._schedule_room_swap(room.room_name, [room], None)
+        return True
+
+    def _take_stale_room_servers(self, hash_byte: int, names: set) -> list:
+        """Remove and return the RoomServers a re-registration replaces.
+
+        That is the one under ``hash_byte`` plus any registered under another
+        hash by the same (or previous) name, which is what a key change leaves.
+        """
+        stale = []
+        for room_hash, room in list(self.room_servers.items()):
+            if room_hash == hash_byte or room.room_name in names:
+                stale.append(self.room_servers.pop(room_hash))
+        return stale
+
+    async def _swap_room_servers(self, stale_rooms: list, room_server) -> None:
+        for old in stale_rooms:
+            try:
+                await old.stop()
+            except Exception as e:
+                logger.error(f"Error stopping replaced room server '{old.room_name}': {e}")
+        # Two overlapping hot reloads can each schedule a swap; a replacement
+        # that a later one has already superseded must not start, or its sync
+        # loop would run untracked.
+        if room_server is not None and self.room_servers.get(room_server.room_hash) is room_server:
+            await room_server.start()
+
+    def _schedule_room_swap(self, name: str, stale_rooms: list, room_server) -> None:
+        """Stop ``stale_rooms`` then start ``room_server`` on the event loop.
+
+        May be called from a non-async HTTP handler thread.
+        """
+        coro = self._swap_room_servers(stale_rooms, room_server)
+        try:
+            loop = asyncio.get_running_loop()
+            self._track_task(loop.create_task(coro))
+        except RuntimeError:
+            # No running event loop in this thread
+            if self._loop and self._loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+                future.add_done_callback(
+                    lambda f: (
+                        logger.error(
+                            f"Room server '{name}' failed: {f.exception()}",
+                            exc_info=f.exception(),
+                        )
+                        if not f.cancelled() and f.exception()
+                        else None
+                    )
+                )
+            else:
+                coro.close()
+                logger.error(f"Cannot start room server '{name}': no event loop available")
 
     def _client_by_pubkey(self, identity_hash: int, pubkey: bytes):
         """The ACL client for an already-authenticated public key.

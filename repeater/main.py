@@ -1421,8 +1421,28 @@ class RepeaterDaemon:
             except Exception as e:
                 logger.debug("Push trace data to companion: %s", e)
 
+    def _unregister_identity_everywhere(self, identity) -> None:
+        """Stop every packet helper answering for ``identity``.
+
+        For a deleted room, or a room's old key after a key change: without
+        this the old key keeps answering logins and requests until a restart.
+        """
+        for helper in (self.login_helper, self.text_helper, self.protocol_request_helper):
+            if helper is not None and hasattr(helper, "unregister_identity"):
+                try:
+                    helper.unregister_identity(identity)
+                except Exception as e:
+                    logger.error(
+                        f"Failed to unregister an identity from {type(helper).__name__}: {e}"
+                    )
+
     def _register_identity_everywhere(
-        self, name: str, identity, config: dict, identity_type: str
+        self,
+        name: str,
+        identity,
+        config: dict,
+        identity_type: str,
+        previous_name: str | None = None,
     ) -> bool:
         """
         Register an identity with the manager and all helpers in one place.
@@ -1448,6 +1468,7 @@ class RepeaterDaemon:
                 identity=identity,
                 identity_type=identity_type,
                 radio_config=self.config.get("radio", {}),
+                previous_name=previous_name,
             )
 
         if self.protocol_request_helper:

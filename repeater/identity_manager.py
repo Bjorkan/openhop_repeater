@@ -144,6 +144,24 @@ class IdentityManager:
         )
         return True
 
+    def unregister_identity(self, name: str) -> Optional[Tuple[Any, dict, str]]:
+        """Remove the identity registered as ``name``; return its entry, or None.
+
+        For a hot reload that re-registers an identity under a new name or
+        key: registration refuses a name or hash that is already taken, so the
+        old entry goes first. Pass the result back to ``register_identity`` to
+        restore it if the new registration is refused.
+        """
+        entry = self.named_identities.pop(name, None)
+        if entry is None:
+            return None
+        identity, _config, identity_type = entry
+        key = (identity.get_public_key()[0], _namespace_for(identity_type))
+        if self.registered_hashes.get(key) == f"{identity_type}:{name}":
+            self.registered_hashes.pop(key, None)
+            self.identities.pop(key, None)
+        return entry
+
     def get_identity_by_hash(
         self, hash_byte: int, namespace: Optional[str] = None
     ) -> Optional[Tuple[Any, dict, str]]:

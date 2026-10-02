@@ -2727,6 +2727,10 @@ class _FakeACL:
         self.admin_password = admin_password
         self.guest_password = guest_password
         self.allow_read_only = True
+        self.load_error = None
+
+    def is_persisted(self, pubkey):
+        return False
 
     def get_num_clients(self):
         return len(self._clients)
@@ -2861,7 +2865,11 @@ def test_acl_endpoints_paths(cherrypy_ctx):
         _FakeClient("cc" * 32, PERM_ACL_GUEST),
     ]
     acl = _FakeACL(clients)
-    login_helper = SimpleNamespace(get_acl_dict=lambda: {0x42: acl, 0x51: _FakeACL([])})
+    by_name = {"repeater": acl, "room1": acl}
+    login_helper = SimpleNamespace(
+        get_acl_dict=lambda: {0x42: acl, 0x51: _FakeACL([])},
+        get_acl_by_name=by_name.get,
+    )
     id_mgr = SimpleNamespace(
         get_identities_by_type=lambda t: (
             [("room1", _FakeIdentityObj(0x42), {})]

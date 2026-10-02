@@ -353,7 +353,7 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
             "Adding secure placeholders — complete setup wizard before login."
         )
         config["repeater"]["security"] = {
-            "max_clients": 1,
+            "max_clients": 32,  # firmware MAX_CLIENTS
             "admin_password": None,
             "guest_password": None,
             "allow_read_only": False,

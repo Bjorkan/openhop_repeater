@@ -33,6 +33,9 @@ class LoginHelper:
 
         self.handlers = {}
         self.acls = {}  # Per-identity ACLs keyed by hash_byte
+        # The same ACLs by registered name ("repeater" or the room's name),
+        # which, unlike the hash byte, cannot collide between identities.
+        self.acls_by_name = {}
         # The repeater identity's ACL, kept so live config updates can re-apply
         # repeater.security without re-registering the identity.
         self._repeater_acl = None
@@ -63,7 +66,7 @@ class LoginHelper:
         hash_byte = identity.get_public_key()[0]
 
         # Create ACL for this identity
-        from repeater.handler_helpers.acl import ACL
+        from repeater.handler_helpers.acl import ACL, acl_identity_label
 
         # Get security config for this identity
         if identity_type == "room_server":
@@ -84,6 +87,8 @@ class LoginHelper:
 
             # Use configured passwords from settings
             final_security = {
+                # Above firmware's 32: room servers store admins only, so their
+                # other clients are sessions, which a busy room has many of.
                 "max_clients": settings.get("max_clients", 50),
                 "admin_password": admin_password,
                 "guest_password": guest_password,
@@ -95,7 +100,9 @@ class LoginHelper:
             admin_password = security.get("admin_password") or None
             guest_password = security.get("guest_password") or None
             final_security = {
-                "max_clients": security.get("max_clients", 10),
+                # Firmware MAX_CLIENTS. Admins survive restarts, and only another
+                # admin grant evicts one, so a small table fills up with them.
+                "max_clients": security.get("max_clients", 32),
                 "admin_password": admin_password,
                 "guest_password": guest_password,
                 "allow_read_only": security.get("allow_read_only", False),
@@ -110,15 +117,63 @@ class LoginHelper:
                 f"max_clients={final_security['max_clients']}"
             )
 
-        # Create ACL for this identity
-        identity_acl = ACL(
-            max_clients=final_security["max_clients"],
-            admin_password=final_security["admin_password"],
-            guest_password=final_security["guest_password"],
-            allow_read_only=final_security["allow_read_only"],
-        )
+        label = acl_identity_label(name, identity_type)
+        existing = self.acls.get(hash_byte)
+        if (
+            existing is not None
+            and not existing.detached
+            and existing.identity_pubkey_hex == identity.get_public_key().hex()
+        ):
+            # A hot re-registration of the same identity (a rename, say). A new
+            # ACL would drop every live session's replay watermark and activity,
+            # and the room sync loop would stop pushing to logged-in clients.
+            identity_acl = existing
+            identity_acl.update_settings(
+                final_security["max_clients"],
+                final_security["admin_password"],
+                final_security["guest_password"],
+                final_security["allow_read_only"],
+                identity_label=label,
+            )
+            self._drop_acl(identity_acl, keep_name=name)
+        else:
+            # Entries persist in the database, keyed by the identity's full
+            # public key; firmware's repeater keeps every entry with
+            # permissions, its room server only admins (saveFilter).
+            identity_acl = ACL(
+                max_clients=final_security["max_clients"],
+                admin_password=final_security["admin_password"],
+                guest_password=final_security["guest_password"],
+                allow_read_only=final_security["allow_read_only"],
+                store=self.sqlite_handler,
+                local_identity=identity,
+                identity_label=label,
+                persist_filter=(lambda c: c.is_admin()) if identity_type == "room_server" else None,
+                adopt_by_label=identity_type == "repeater",
+            )
+            # One ACL per identity: the one this replaces (the same name, or
+            # the same stored rows after a key change) stops being listed and
+            # stops writing, though its old handlers live until a restart.
+            # Detached before the load, so nothing it writes is missed.
+            for superseded in {
+                self.acls_by_name.get(name),
+                self._live_acl_for_store_key(identity_acl.store_key or ""),
+            }:
+                if superseded is not None and superseded is not identity_acl:
+                    superseded.detach_store()
+                    self._drop_acl(superseded)
+            identity_acl.load()
 
+        displaced = self.acls.get(hash_byte)
+        if displaced is not None and displaced is not identity_acl and not displaced.detached:
+            # Handlers are keyed by the hash byte, so the text and request
+            # helpers can reach only one of two identities sharing it.
+            logger.warning(
+                f"'{name}' shares hash 0x{hash_byte:02X} with another identity; "
+                f"messages and requests to that hash reach '{name}' only"
+            )
         self.acls[hash_byte] = identity_acl
+        self.acls_by_name[name] = identity_acl
         if identity_type != "room_server":
             self._repeater_acl = identity_acl
         logger.info(f"Created ACL for {identity_type} '{name}': hash=0x{hash_byte:02X}")
@@ -199,16 +254,20 @@ class LoginHelper:
         cfg = config if isinstance(config, dict) else self.config
         security = (cfg or {}).get("repeater", {}).get("security", {}) or {}
 
-        acl.admin_password = security.get("admin_password") or ""
-        acl.guest_password = security.get("guest_password") or ""
-        acl.allow_read_only = bool(security.get("allow_read_only", False))
         try:
-            acl.max_clients = int(security.get("max_clients", acl.max_clients))
+            max_clients = int(security.get("max_clients", acl.max_clients))
         except (TypeError, ValueError):
+            max_clients = acl.max_clients
             logger.warning(
                 "Ignoring invalid repeater.security.max_clients=%r during security refresh",
                 security.get("max_clients"),
             )
+        acl.update_settings(
+            max_clients,
+            security.get("admin_password"),
+            security.get("guest_password"),
+            bool(security.get("allow_read_only", False)),
+        )
 
         logger.info("Refreshed repeater ACL security settings from config")
         return True
@@ -343,6 +402,104 @@ class LoginHelper:
     def get_acl_for_identity(self, hash_byte: int):
         """Get ACL for a specific identity."""
         return self.acls.get(hash_byte)
+
+    def get_acl_by_name(self, name: str):
+        """The ACL of the identity registered under ``name`` ("repeater" or a room's name)."""
+        return self.acls_by_name.get(name)
+
+    def move_room_acl(
+        self,
+        old_name: str,
+        old_pubkey_hex: str,
+        new_pubkey_hex: str,
+        new_name: str,
+        commit=None,
+    ) -> None:
+        """Move a room server's stored ACL to its new key and name around ``commit``.
+
+        ``update_identity`` calls this when it changes a room's key or name,
+        with ``commit`` saving the config; see ``move_identity_acl``. Room
+        servers are not adopted by label, so without the move a new key would
+        start with an empty ACL. The live ACL writes to the moved rows after,
+        so changes made before the restart that applies the new key are kept.
+        """
+        from repeater.handler_helpers.acl import acl_identity_label, move_identity_acl
+
+        label = acl_identity_label(new_name, "room_server")
+        if self.sqlite_handler is None and old_pubkey_hex.lower() != new_pubkey_hex.lower():
+            # A key change with nowhere to move the entries would save a key
+            # whose access list is gone.
+            raise RuntimeError("no ACL store is available to move the room's access list")
+        live = self.acls_by_name.get(old_name)
+        if live is None or live.store_key != old_pubkey_hex.lower():
+            # The name index can lag the config (a hot reload refused), but
+            # the store key names the rows, and one ACL at most holds it.
+            live = self._live_acl_for_store_key(old_pubkey_hex)
+        if live is not None:
+            live.move_store(new_pubkey_hex, label, commit)
+            return
+        move_identity_acl(
+            self.sqlite_handler,
+            old_pubkey_hex,
+            new_pubkey_hex,
+            acl_identity_label(old_name, "room_server"),
+            label,
+            commit,
+        )
+
+    def forget_identity_acl(self, name: str, pubkey_hex: str) -> int:
+        """Drop a deleted identity's stored ACL, and stop its live ACL writing it back."""
+        from repeater.handler_helpers.acl import acl_identity_label
+
+        live = self.acls_by_name.get(name)
+        if live is None or live.store_key != pubkey_hex.lower():
+            # As in move_room_acl: a refused hot reload leaves the live ACL
+            # under its old name, still writing rows for this key.
+            live = self._live_acl_for_store_key(pubkey_hex)
+        if live is not None:
+            live.detach_store()
+            self._drop_acl(live)
+        if self.sqlite_handler is None:
+            return 0
+        # Every key: a rekey whose cleanup failed left rows under this label at
+        # the old one. Names are unique, so no other room holds this label.
+        return self.sqlite_handler.delete_acl_label(acl_identity_label(name, "room_server"))
+
+    def unregister_identity(self, identity) -> bool:
+        """Stop answering logins for ``identity``: it was deleted or given a new key.
+
+        Only its own handler goes; another identity now registered on the
+        same hash byte keeps its. Its ACL is detached and unlisted.
+        """
+        pubkey = identity.get_public_key()
+        hash_byte = pubkey[0]
+        handler = self.handlers.get(hash_byte)
+        owner = getattr(handler, "local_identity", None)
+        removed = False
+        if owner is not None and owner.get_public_key() == pubkey:
+            del self.handlers[hash_byte]
+            removed = True
+        # Both indexes: one whose hash byte another identity took is only
+        # listed by name.
+        listed = [*self.acls.values(), *self.acls_by_name.values()]
+        for acl in {a for a in listed if a.identity_pubkey_hex == pubkey.hex()}:
+            acl.detach_store()
+            self._drop_acl(acl)
+        return removed
+
+    def _drop_acl(self, acl, keep_name: str = None) -> None:
+        """Remove ``acl`` from both indexes, except under ``keep_name``."""
+        for name, entry in list(self.acls_by_name.items()):
+            if entry is acl and name != keep_name:
+                del self.acls_by_name[name]
+        if keep_name is None:
+            for hash_byte, entry in list(self.acls.items()):
+                if entry is acl:
+                    del self.acls[hash_byte]
+
+    def _live_acl_for_store_key(self, pubkey_hex: str):
+        key = pubkey_hex.lower()
+        return next((acl for acl in self.acls_by_name.values() if acl.store_key == key), None)
 
     def list_authenticated_clients(self, hash_byte: int = None):
         """List authenticated clients for a specific identity or all identities."""
