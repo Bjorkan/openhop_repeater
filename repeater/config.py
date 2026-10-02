@@ -507,6 +507,40 @@ def _load_or_create_identity_key(path: Optional[str] = None) -> bytes:
     return key
 
 
+# MeshCore's private LoRa sync word, as the USB/TCP modem firmware expects it.
+MESHCORE_SYNC_WORD = 0x12
+
+
+def _checked_modem_sync_word(sync_word: int, board_config: dict, radio_type: str) -> int:
+    """The sync word to hand a USB/TCP modem, warning when it is not MeshCore's.
+
+    These are the drivers that actually push the value to the radio, and a
+    modem on another sync word connects, answers pings and transmits, yet hears
+    no MeshCore traffic -- a silent failure. A radios[] entry inherits the
+    top-level ``radio.sync_word``, which the SX1262 driver ignores (SX1262Radio
+    stores it but never calls setSyncWord), so a stray top-level value is
+    harmless until a modem entry picks it up.
+    """
+    if sync_word != MESHCORE_SYNC_WORD:
+        radio_id = board_config.get("_radio_label") or board_config.get("_radio_id")
+        if radio_id:
+            where = f"radios[{radio_id}].radio"
+            if board_config.get("_sync_word_inherited"):
+                where += " (it inherits the top-level radio.sync_word)"
+        else:
+            where = "its radio section"
+        logger.warning(
+            "%s sync_word is 0x%X, not MeshCore's 0x%02X: the modem will not hear "
+            "MeshCore traffic. Set sync_word: 0x%02X in %s.",
+            f"Radio {radio_id!r} ({radio_type})" if radio_id else f"{radio_type} radio",
+            sync_word,
+            MESHCORE_SYNC_WORD,
+            MESHCORE_SYNC_WORD,
+            where,
+        )
+    return sync_word
+
+
 def get_radio_for_board(board_config: dict):
     board_config = normalize_modem_config(board_config)
 
@@ -752,7 +786,13 @@ def get_radio_for_board(board_config: dict):
             spreading_factor=int(radio_cfg.get("spreading_factor", 8)),
             coding_rate=int(radio_cfg.get("coding_rate", 8)),
             tx_power=int(radio_cfg.get("tx_power", 22)),
-            sync_word=_parse_int(radio_cfg.get("sync_word", 0x12), default=0x12),
+            sync_word=_checked_modem_sync_word(
+                _parse_int(
+                    radio_cfg.get("sync_word", MESHCORE_SYNC_WORD), default=MESHCORE_SYNC_WORD
+                ),
+                board_config,
+                radio_type,
+            ),
             preamble_length=int(radio_cfg.get("preamble_length", 16)),
             lbt_enabled=bool(tcp_cfg.get("lbt_enabled", True)),
             lbt_max_attempts=int(tcp_cfg.get("lbt_max_attempts", 5)),
@@ -794,7 +834,13 @@ def get_radio_for_board(board_config: dict):
             spreading_factor=int(radio_cfg.get("spreading_factor", 8)),
             coding_rate=int(radio_cfg.get("coding_rate", 8)),
             tx_power=int(radio_cfg.get("tx_power", 22)),
-            sync_word=_parse_int(radio_cfg.get("sync_word", 0x12), default=0x12),
+            sync_word=_checked_modem_sync_word(
+                _parse_int(
+                    radio_cfg.get("sync_word", MESHCORE_SYNC_WORD), default=MESHCORE_SYNC_WORD
+                ),
+                board_config,
+                radio_type,
+            ),
             preamble_length=int(radio_cfg.get("preamble_length", 16)),
             lbt_enabled=bool(usb_cfg.get("lbt_enabled", True)),
             lbt_max_attempts=int(usb_cfg.get("lbt_max_attempts", 5)),
@@ -881,6 +927,10 @@ def _merge_radio_entry(global_config: dict, entry: dict) -> dict:
         raise ValueError(f"radios[] entry {radio_id!r} missing radio_type")
 
     merged["_radio_id"] = str(radio_id)
+    # build_radio_stack pops _radio_id; this survives it, to name the radio in logs.
+    merged["_radio_label"] = str(radio_id)
+    own_radio = entry.get("radio") if isinstance(entry.get("radio"), dict) else {}
+    merged["_sync_word_inherited"] = "sync_word" not in own_radio
     # Hint for CH341 path: do not install process-global SPI/GPIO defaults.
     merged["_ch341_per_instance"] = True
     return merged
